@@ -1,0 +1,41 @@
+# Entornos virtuales
+.venv/
+venv/
+
+# Cachés de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
+# Logs y datos generados
+*.csv
+*.tsv
+*.parquet
+*.log
+sistema_vigilancia/data/logs/
+
+# Pesos / modelos de ML
+*.pt
+*.pth
+*.onnx
+*.pb
+*.tflite
+*.h5
+*.ckpt
+*.ckpt.*
+*.safetensors
+*.engine
+*.plan
+*.trt
+*.mlmodel
+
+# Entornos/IDE
+.idea/
+.vscode/
+
+
