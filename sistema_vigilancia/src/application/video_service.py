@@ -16,9 +16,9 @@ class VideoProcessingService:
     def __init__(
         self,
         detection: DetectionPort,
-        tracking: TrackingPort,
+        tracking: Optional[TrackingPort],
         age_gender: AgeGenderPort,
-        depth: DepthEstimationPort,
+        depth: Optional[DepthEstimationPort],
         event_logger: EventLogger,
         polygon_points: List[Tuple[int, int]],
         visualize: bool = True,

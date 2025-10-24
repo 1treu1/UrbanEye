@@ -3,16 +3,18 @@ from __future__ import annotations
 from typing import Optional
 
 import cv2
+import torch
 from deepface import DeepFace
 
 from ..ports.age_gender_port import AgeGender, AgeGenderPort
 
 
 class DeepFaceEstimator(AgeGenderPort):
-    def __init__(self, analyze_every_n_frames: int = 15) -> None:
+    def __init__(self, analyze_every_n_frames: int = 15, use_gpu: bool = True) -> None:
         self.counter = 0
         self.every = max(1, analyze_every_n_frames)
         self.cache: dict[int, AgeGender] = {}
+        self.device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
 
     def estimate(self, frame_bgr, person_bbox) -> AgeGender:
         self.counter += 1
@@ -27,7 +29,15 @@ class DeepFaceEstimator(AgeGenderPort):
         try:
             # DeepFace espera RGB
             rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            analysis = DeepFace.analyze(rgb, actions=['age', 'gender'], enforce_detection=False, prog_bar=False)
+            # Configurar backend para usar GPU si está disponible
+            backend = "tensorflow" if self.device == "cuda" else "opencv"
+            analysis = DeepFace.analyze(
+                rgb, 
+                actions=['age', 'gender'], 
+                enforce_detection=False, 
+                prog_bar=False,
+                detector_backend=backend
+            )
             if isinstance(analysis, list):
                 analysis = analysis[0]
             age = int(analysis.get('age')) if analysis.get('age') is not None else None

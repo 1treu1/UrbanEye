@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -20,9 +20,9 @@ class SurveillanceOrchestrator:
     def __init__(
         self,
         detection: DetectionPort,
-        tracking: TrackingPort,
+        tracking: Optional[TrackingPort],
         age_gender: AgeGenderPort,
-        depth: DepthEstimationPort,
+        depth: Optional[DepthEstimationPort],
         polygon_points: List[Tuple[int, int]],
     ) -> None:
         self.detection = detection
@@ -34,10 +34,25 @@ class SurveillanceOrchestrator:
 
     def process_frame(self, frame_bgr):
         detections = self.detection.detect(frame_bgr)
-        det_for_tracker = [(*d.bbox, float(d.confidence)) for d in detections if d.class_name == "person"]
-        tracks = self.tracking.update(frame_bgr, det_for_tracker)
+        
+        # Tracking solo si está disponible
+        if self.tracking is not None:
+            det_for_tracker = [(*d.bbox, float(d.confidence)) for d in detections if d.class_name == "person"]
+            tracks = self.tracking.update(frame_bgr, det_for_tracker)
+        else:
+            # Sin tracking, crear tracks simples desde detecciones
+            tracks = []
+            for i, d in enumerate(detections):
+                if d.class_name == "person":
+                    # Crear un track simple
+                    from .models import Track
+                    track = Track(track_id=i, bbox=d.bbox, confidence=d.confidence)
+                    tracks.append(track)
 
-        depth_map = self.depth.estimate_depth(frame_bgr)
+        # Profundidad solo si está disponible
+        depth_map = None
+        if self.depth is not None:
+            depth_map = self.depth.estimate_depth(frame_bgr)
 
         events: List[PersonState] = []
         for t in tracks:

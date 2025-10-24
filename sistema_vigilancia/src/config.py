@@ -20,11 +20,12 @@ def build_default_polygon(frame_width: int = 1280, frame_height: int = 720) -> L
 class AppConfig:
     source: Optional[int | str] = 0
     visualize: bool = True
-    detector_model: str = "yolov8n.pt"
-    midas_model: str = "DPT_Large"  # or "DPT_Hybrid", "MiDaS_small"
+    detector_model: str = "yolov8n.pt"  # Modelo más ligero para CPU
+    midas_model: str = "MiDaS_small"  # Modelo más ligero para CPU
     deepface_every_n_frames: int = 15
     polygon_points: List[Tuple[int, int]] = field(default_factory=build_default_polygon)
     csv_output_path: str = str(Path(__file__).resolve().parent.parent / "data" / "logs" / "events.csv")
+    use_gpu: bool = True
 
 
 

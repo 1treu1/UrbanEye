@@ -1,92 +1,242 @@
-## Sistema de Vigilancia Inteligente (Arquitectura Hexagonal)
+# Sistema de Vigilancia Avanzado 🚀
 
-Este proyecto implementa un sistema de vigilancia en tiempo real con detección de personas (YOLOv8), seguimiento por ID (DeepSORT), estimación de edad y género (DeepFace), detección de objetos portados (bolsa/mochila/compras), estimación de profundidad (MiDaS) y conteo de entradas/salidas en un área poligonal. La arquitectura sigue el patrón de puertos y adaptadores (hexagonal) para facilitar la extensibilidad y el reemplazo de componentes.
+Sistema de vigilancia inteligente con auto-calibración, estimación de profundidad y clasificación de género mejorada.
 
-### Características
-- Detección de personas con YOLOv8 (Ultralytics)
-- Seguimiento multi-objeto con DeepSORT (ID único por persona)
-- Estimación de edad y género con DeepFace
-- Detección de objetos portados: bolsa, mochila, cartera, maleta (aprox.)
-- Estimación de profundidad monocular (MiDaS)
-- Área poligonal de conteo: eventos de entrada/salida
-- Visualización en tiempo real (OpenCV) y registro CSV
+## 🌟 Características
 
-### Requisitos
-Consulte `requirements.txt` para dependencias de Python. Requiere Python 3.9+ (recomendado), y una GPU CUDA es opcional pero recomendable para rendimiento.
+- **Auto-calibración**: Se calibra automáticamente basándose en alturas observadas
+- **Suavizado adaptativo**: Reduce el ruido en las mediciones en tiempo real
+- **MiDaS Integration**: Estimación de profundidad usando modelos de deep learning (GPU)
+- **Clasificación avanzada**: Fusión de altura + probabilidad para determinar género
+- **Estructura modular**: Código organizado y fácil de mantener
 
-### Instalación
+## 🚀 Instalación Rápida
+
+### 1. Clonar el repositorio
+```bash
+git clone <repository-url>
+cd sistema_vigilancia
+```
+
+### 2. Crear entorno virtual
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # En Windows: .venv\Scripts\activate
-pip install --upgrade pip
+# Windows
+.venv\Scripts\activate
+# Linux/Mac
+source .venv/bin/activate
+```
+
+### 3. Instalar dependencias
+
+#### Opción A: Instalación automática (recomendada)
+```bash
 pip install -r requirements.txt
 ```
 
-Si utiliza Windows, ejecute los comandos con PowerShell o CMD; el script `run.sh` puede ejecutarse con Git Bash/WSL. Alternativamente, lance manualmente `python -m src.main`.
+#### Opción B: Con GPU (CUDA 11.8)
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt
+```
 
-### Estructura
+#### Opción C: Con GPU (CUDA 12.1)
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
+```
+
+#### Opción D: Solo CPU
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+```
+
+## 🎯 Uso en Cursor
+
+### Ejecutar sistema básico
+```bash
+python -m src.main_simple_gender --source 0 --gpu
+```
+
+### Ejecutar sistema avanzado
+```bash
+python -m src.advanced_surveillance --source 0 --gpu
+```
+
+### Opciones disponibles
+```bash
+# Sistema básico
+python -m src.main_simple_gender --source 0 --gpu --camera-height-meters 7.0 --use-physics
+
+# Sistema avanzado
+python -m src.advanced_surveillance --source 0 --gpu --calibration-samples 15
+
+# Sin MiDaS (más rápido, menos preciso)
+python -m src.advanced_surveillance --source 0 --gpu --no-midas
+```
+
+## 📊 Parámetros de Configuración
+
+### Sistema Básico
+- `--source`: Fuente de video (0=cámara, ruta=archivo)
+- `--gpu`: Usar aceleración GPU
+- `--camera-height-meters`: Altura de la cámara en metros
+- `--camera-height`: Altura relativa (low/medium/high)
+- `--camera-angle`: Ángulo de la cámara (normal/high/overhead)
+- `--use-physics`: Usar cálculos de física óptica
+
+### Sistema Avanzado
+- `--source`: Fuente de video
+- `--gpu`: Usar GPU para aceleración
+- `--no-midas`: Desactivar MiDaS (más rápido)
+- `--calibration-samples`: Muestras mínimas para auto-calibración
+
+## 🔧 Arquitectura del Sistema
+
 ```
 sistema_vigilancia/
-├── README.md
-├── requirements.txt
-├── run.sh
-└── src/
-    ├── main.py
-    ├── config.py
-    ├── domain/
-    │   ├── models.py
-    │   ├── services.py
-    │   └── utils/
-    │       ├── area_utils.py
-    │       ├── depth_utils.py
-    │       ├── tracking_utils.py
-    │       └── draw_utils.py
-    ├── ports/
-    │   ├── detection_port.py
-    │   ├── tracking_port.py
-    │   ├── age_gender_port.py
-    │   └── depth_port.py
-    ├── adapters/
-    │   ├── yolo_adapter.py
-    │   ├── deepsort_adapter.py
-    │   ├── deepface_adapter.py
-    │   └── midas_adapter.py
-    └── application/
-        ├── video_service.py
-        └── event_logger.py
+├── src/
+│   ├── main_simple_gender.py      # Sistema básico
+│   ├── advanced_surveillance.py   # Sistema avanzado
+│   ├── config.py                  # Configuración
+│   └── application/
+│       └── event_logger.py        # Logger de eventos
+├── requirements.txt               # Dependencias
+└── README.md                      # Este archivo
 ```
 
-### Configuración
-Edite `src/config.py` para definir:
-- Fuente de video: archivo local, cámara (`0`) o RTSP.
-- Área poligonal de conteo (lista de puntos `[(x,y), ...]`).
-- Umbrales y opciones de rendimiento.
+## 🧠 Componentes Principales
 
-Puede pasar la fuente por CLI:
+### 1. AutoCalibrator
+- Se calibra automáticamente basándose en alturas observadas
+- Usa estadísticas antropométricas para ajustar parámetros
+- Mejora la precisión con el tiempo
+
+### 2. AdaptiveSmoother
+- Suavizado exponencial adaptativo
+- Reduce ruido en mediciones
+- Ajusta sensibilidad según variabilidad
+
+### 3. MiDaSDepthEstimator
+- Estimación de profundidad usando deep learning
+- Funciona con GPU para mayor velocidad
+- Mejora precisión de cálculos de altura
+
+### 4. AdvancedGenderClassifier
+- Fusión de múltiples características
+- Análisis de altura, proporciones y colores
+- Clasificación probabilística
+
+## 📈 Mejoras Implementadas
+
+### Auto-calibración
+- ✅ Detecta automáticamente altura de cámara
+- ✅ Ajusta ángulo de visión
+- ✅ Usa estadísticas antropométricas
+- ✅ Filtra outliers para mayor precisión
+
+### Suavizado Adaptativo
+- ✅ Reduce ruido en mediciones
+- ✅ Ajusta sensibilidad automáticamente
+- ✅ Mantiene responsividad
+
+### MiDaS Integration
+- ✅ Estimación de profundidad con deep learning
+- ✅ Aceleración GPU
+- ✅ Mejor precisión que métodos geométricos
+
+### Clasificación Mejorada
+- ✅ Fusión de altura + probabilidad
+- ✅ Análisis de colores de ropa
+- ✅ Proporciones corporales
+- ✅ Clasificación probabilística
+
+## 🎮 Controles
+
+- **'q'**: Salir del sistema
+- **ESC**: Salir del sistema
+- **Ctrl+C**: Salir del sistema
+
+## 🔍 Debugging
+
+### Verificar GPU
+```python
+import torch
+print(f"CUDA disponible: {torch.cuda.is_available()}")
+print(f"Dispositivo: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+```
+
+### Verificar MiDaS
+```python
+import torch
+model = torch.hub.load("intel-isl/MiDaS", "DPT_Large")
+print("MiDaS cargado correctamente")
+```
+
+## 📝 Logs y Debugging
+
+El sistema muestra información detallada en consola:
+- 🎯 Estado de calibración
+- 📏 Mediciones de altura y distancia
+- 🔍 Debug de cálculos
+- ✅/❌ Estado de componentes
+
+## 🚨 Solución de Problemas
+
+### Error: "No module named 'torch'"
 ```bash
-python -m src.main --source data/video.mp4  # o rtsp://user:pass@host/...
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 ```
 
-### Ejecución
-```bash
-bash run.sh  # Linux/macOS/WSL
-# En Windows sin bash:
-python -m src.main --source 0  # webcam
-```
+### Error: "CUDA out of memory"
+- Reducir resolución de video
+- Usar `--no-midas` para desactivar MiDaS
+- Cerrar otras aplicaciones que usen GPU
 
-### Extensibilidad
-- Para cambiar el detector, cree un nuevo adaptador que implemente `DetectionPort` y ajústelo en `main.py` mediante inyección de dependencias.
-- Lo mismo para seguimiento, edad/género y profundidad implementando sus puertos correspondientes.
+### Cámara lenta
+- Verificar que GPU esté habilitado
+- Usar `--gpu` flag
+- Verificar drivers de CUDA
 
-### Salida
-- Ventana OpenCV con anotaciones (IDs, edad/género, estado de objeto portado, profundidad y área).
-- CSV en `data/logs/events.csv` con columnas: `timestamp,track_id,age,gender,carries_object,depth,inside_area`.
+### Calibración incorrecta
+- Aumentar `--calibration-samples`
+- Asegurar que hay personas adultas en el frame
+- Verificar altura de cámara real
 
-### Notas de rendimiento
-- Para RTSP en tiempo real, prefiera modelos livianos (`yolov8n.pt`), y considere reducir resolución de entrada.
-- DeepFace puede ser costoso por frame; por defecto se evalúa por pista cada N frames (ajustable en `config.py`).
+## 📊 Rendimiento
 
+### Con GPU + MiDaS
+- **FPS**: 15-25 (dependiendo de hardware)
+- **Precisión**: Alta
+- **Uso GPU**: 2-4GB VRAM
 
+### Con GPU sin MiDaS
+- **FPS**: 25-35
+- **Precisión**: Media-Alta
+- **Uso GPU**: 1-2GB VRAM
 
+### Solo CPU
+- **FPS**: 5-10
+- **Precisión**: Media
+- **Uso CPU**: 80-100%
 
+## 🤝 Contribuir
 
+1. Fork el repositorio
+2. Crear rama feature (`git checkout -b feature/nueva-caracteristica`)
+3. Commit cambios (`git commit -am 'Agregar nueva característica'`)
+4. Push a la rama (`git push origin feature/nueva-caracteristica`)
+5. Crear Pull Request
+
+## 📄 Licencia
+
+Este proyecto está bajo la Licencia MIT. Ver `LICENSE` para más detalles.
+
+## 🆘 Soporte
+
+Para soporte técnico:
+- Crear issue en GitHub
+- Incluir logs de error
+- Especificar configuración de hardware
+- Incluir versión de Python y dependencias

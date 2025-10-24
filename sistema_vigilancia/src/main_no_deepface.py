@@ -10,41 +10,36 @@ from .application.event_logger import EventLogger
 # Ports
 from .ports.detection_port import DetectionPort
 from .ports.tracking_port import TrackingPort
-from .ports.age_gender_port import AgeGenderPort
-# from .ports.depth_port import DepthEstimationPort  # Comentado temporalmente
+from .ports.depth_port import DepthEstimationPort
 
-# Adapters (injected; import here to keep wiring centralized)
+# Adapters (sin DeepFace)
 from .adapters.yolo_adapter import YOLOv8Detector
 from .adapters.deepsort_adapter import DeepSortTracker
-from .adapters.deepface_adapter import DeepFaceEstimator
-# from .adapters.midas_adapter import MiDaSDepthEstimator  # Comentado temporalmente
+from .adapters.midas_adapter import MiDaSDepthEstimator
+
+
+class DummyAgeGenderPort:
+    """Puerto dummy para reemplazar DeepFace"""
+    def estimate(self, frame_bgr, person_bbox):
+        from .ports.age_gender_port import AgeGender
+        return AgeGender(age=None, gender=None)
 
 
 def build_services(config: AppConfig) -> VideoProcessingService:
-    # Detección de personas con YOLOv8
     detection: DetectionPort = YOLOv8Detector(
         model_name=config.detector_model, 
         use_gpu=config.use_gpu
     )
-    
-    # Tracking de personas (comentado temporalmente)
-    # tracking: TrackingPort = DeepSortTracker(max_age=30, n_init=2)
-    
-    # Análisis de género con DeepFace
-    age_gender: AgeGenderPort = DeepFaceEstimator(
-        analyze_every_n_frames=config.deepface_every_n_frames,
-        use_gpu=config.use_gpu
-    )
-    
-    # Estimación de profundidad (comentado temporalmente)
-    # depth: DepthEstimationPort = MiDaSDepthEstimator(model_name=config.midas_model)
+    tracking: TrackingPort = DeepSortTracker(max_age=30, n_init=2)
+    age_gender = DummyAgeGenderPort()  # Sin DeepFace
+    depth: DepthEstimationPort = MiDaSDepthEstimator(model_name=config.midas_model)
 
     logger = EventLogger(csv_path=config.csv_output_path)
     service = VideoProcessingService(
         detection=detection,
-        tracking=None,  # Comentado temporalmente
+        tracking=tracking,
         age_gender=age_gender,
-        depth=None,  # Comentado temporalmente
+        depth=depth,
         event_logger=logger,
         polygon_points=config.polygon_points,
         visualize=config.visualize,
@@ -53,7 +48,7 @@ def build_services(config: AppConfig) -> VideoProcessingService:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sistema de Vigilancia - Detección de Personas y Género")
+    parser = argparse.ArgumentParser(description="Sistema de Vigilancia - Sin DeepFace")
     parser.add_argument(
         "--source",
         type=str,
@@ -103,7 +98,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
 

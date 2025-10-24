@@ -3,15 +3,18 @@ from __future__ import annotations
 from typing import List
 
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 from ..ports.detection_port import Detection, DetectionPort
 
 
 class YOLOv8Detector(DetectionPort):
-    def __init__(self, model_name: str = "yolov8n.pt", conf: float = 0.25) -> None:
+    def __init__(self, model_name: str = "yolov8n.pt", conf: float = 0.25, use_gpu: bool = True) -> None:
         self.model = YOLO(model_name)
         self.conf = conf
+        self.device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
+        self.model.to(self.device)
 
     def detect(self, frame_bgr) -> List[Detection]:
         res = self.model.predict(frame_bgr[..., ::-1], conf=self.conf, verbose=False)
