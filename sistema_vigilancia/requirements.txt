@@ -3,6 +3,8 @@ opencv-python>=4.8.0
 torch>=2.0.0
 torchvision>=0.15.0
 deepface>=0.0.92
+gradio==4.44.0
+gradio-client==1.2.0
 deep-sort-realtime>=1.3.2
 numpy>=1.24.0
 pandas>=2.0.0

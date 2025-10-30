@@ -1,44 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 from typing import Optional
 
-from .config import AppConfig, build_default_polygon
-from .application.video_service import VideoProcessingService
-from .application.event_logger import EventLogger
-
-# Ports
-from .ports.detection_port import DetectionPort
-from .ports.tracking_port import TrackingPort
-from .ports.age_gender_port import AgeGenderPort
-from .ports.depth_port import DepthEstimationPort
-
-# Adapters (injected; import here to keep wiring centralized)
-from .adapters.yolo_adapter import YOLOv8Detector
-from .adapters.deepsort_adapter import DeepSortTracker
-from .adapters.deepface_adapter import DeepFaceEstimator
-from .adapters.midas_adapter import MiDaSDepthEstimator
-
-
-def build_services(config: AppConfig) -> VideoProcessingService:
-    detection: DetectionPort = YOLOv8Detector(model_name=config.detector_model)
-    tracking: TrackingPort = DeepSortTracker(max_age=30, n_init=2)
-    age_gender: AgeGenderPort = DeepFaceEstimator(
-        analyze_every_n_frames=config.deepface_every_n_frames
-    )
-    depth: DepthEstimationPort = MiDaSDepthEstimator(model_name=config.midas_model)
-
-    logger = EventLogger(csv_path=config.csv_output_path)
-    service = VideoProcessingService(
-        detection=detection,
-        tracking=tracking,
-        age_gender=age_gender,
-        depth=depth,
-        event_logger=logger,
-        polygon_points=config.polygon_points,
-        visualize=config.visualize,
-    )
-    return service
+import cv2
+from .gradio_stream import build_demo, analyze_frame
+from .http_stream import build_app
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,34 +14,67 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--source",
         type=str,
-        default="0",
-        help="Fuente de video: ruta, 0 para webcam, o URL RTSP",
+        default="",
+        help="Fuente de video: ruta, 0 para webcam, o URL RTSP. Por defecto usa el video local",
     )
     parser.add_argument(
-        "--polygon",
+        "--ui",
         type=str,
-        default="",
-        help="Puntos del polígono 'x1,y1;x2,y2;...'; por defecto un rectángulo central",
+        choices=["gradio", "cv2", "http"],
+        default="gradio",
+        help="Interfaz de visualización: gradio (web), cv2 (ventana) o http (MJPEG)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("PORT", "7860")),
+        help="Puerto HTTP para Gradio (solo si --ui=gradio)",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    # Default to bundled demo video if not provided and UI is gradio
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    default_video = os.path.join(base_dir, "videos", "face-demographics-walking-and-pause.mp4")
+
+    if args.ui == "gradio":
+        vsource = args.source if args.source else default_video
+        demo = build_demo(vsource)
+        demo.launch(server_name="0.0.0.0", server_port=args.port, share=True)
+        return
+
+    if args.ui == "http":
+        # Simple servidor HTTP con MJPEG streaming para entornos headless
+        import uvicorn
+        vsource = args.source if args.source else default_video
+        app = build_app(vsource)
+        uvicorn.run(app, host="0.0.0.0", port=args.port)
+        return
+
+    # cv2 window pipeline using only DeepFace
     if args.source == "0":
         source: Optional[int | str] = 0
     else:
-        source = args.source
+        source = args.source if args.source else default_video
 
-    polygon = (
-        [tuple(map(int, p.split(","))) for p in args.polygon.split(";")]
-        if args.polygon
-        else build_default_polygon()
-    )
-
-    config = AppConfig(source=source, polygon_points=polygon)
-    service = build_services(config)
-    service.run(source=config.source)
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        raise RuntimeError(f"No se pudo abrir la fuente: {source}")
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            annotated = analyze_frame(frame)
+            cv2.imshow("DeepFace - age/gender/race/emotion", annotated)
+            if cv2.waitKey(1) & 0xFF == 27:  # ESC
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

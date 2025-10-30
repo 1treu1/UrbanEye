@@ -90,3 +90,4 @@ python -m src.main --source 0  # webcam
 
 
 
+cd /workspace/UrbanEye/sistema_vigilancia && . ../.venv/bin/activate 2>/dev/null || true && PORT=7860 python -m src.main --ui http --port 7860
