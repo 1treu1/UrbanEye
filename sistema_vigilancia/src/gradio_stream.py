@@ -1,764 +1,57 @@
+"""Gradio interface for video stream analysis - Refactored modular version."""
+
 from __future__ import annotations
 
 import os
-from typing import Generator, List, Tuple, Optional, Dict, Any
-from collections import deque
-
+from typing import Generator, Optional
 import cv2
 import gradio as gr
 import numpy as np
-from deepface import DeepFace
-from ultralytics import YOLO
+
+from .frame_analyzer import analyze_frame
+from .roi_manager import set_roi_config, flush_window, write_track_to_csv
+import sistema_vigilancia.src.config as config
 
 
-_GPU_READY = False
-_ROI_MODE: str = "none"  # none | consolidated | visits
-_CSV_PATH: str = ""
-_FPS_ASSUMED: int = 22
-_WINDOW_FRAMES: int = 0
-_GLOBAL_FRAME_IDX: int = 0
-
-# YOLOv11 tracker
-_YOLO_MODEL: Optional[YOLO] = None
-_YOLO_MODEL_INITIALIZED: bool = False
-
-# Track data storage
-_TRACKS: Dict[int, Dict[str, Any]] = {}  # track_id -> {bbox, attributes, trail, enter_time, etc.}
-_TRAILS: Dict[int, deque] = {}  # track_id -> deque of (x, y) positions for trail drawing
-_MAX_TRAIL_LENGTH: int = 50  # Maximum points in trail
-_LEAVE_TOL: int = 5  # visits mode tolerance
-
-# Optimization: DeepFace throttling and caching
-_DEEPFACE_FRAME_SKIP: int = 1  # Run DeepFace every frame (set to 1 for full data collection)
-_LAST_DEEPFACE_FRAME: int = -1  # Last frame where DeepFace was executed
-_DEEPFACE_CACHE: Dict[int, Dict[str, Any]] = {}  # Cache DeepFace results per track_id
-_DEEPFACE_CACHE_AGE: int = 5  # Frames before cache expires
-
-
-def _init_yolo_model() -> None:
-    """Initialize YOLOv11 model for person tracking."""
-    global _YOLO_MODEL, _YOLO_MODEL_INITIALIZED
-    if _YOLO_MODEL_INITIALIZED and _YOLO_MODEL is not None:
-        return
+def stream_generator(
+    video_path: str,
+    analyze_every_n: int = 10,
+    max_width: int = 640,
+    roi_size: float = 0.65
+) -> Generator[np.ndarray, None, None]:
+    """Generate annotated video frames for Gradio streaming.
     
-    try:
-        # Use YOLO11 nano for speed - use local file if available
-        import os
-        model_path = "yolo11n.pt"
-        # Check if model exists in current directory or workspace root
-        if not os.path.exists(model_path):
-            # Try workspace root
-            workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            model_path_alt = os.path.join(workspace_root, "yolo11n.pt")
-            if os.path.exists(model_path_alt):
-                model_path = model_path_alt
-        
-        _YOLO_MODEL = YOLO(model_path)  # nano version for speed
-        _YOLO_MODEL_INITIALIZED = True
-        print(f"YOLO11 model initialized successfully from {model_path}")
-    except Exception as e:
-        print(f"Warning: Could not initialize YOLO11 model: {e}")
-        _YOLO_MODEL = None
-        _YOLO_MODEL_INITIALIZED = False
-
-
-
-
-def _flush_window() -> None:
-    """Flush tracks that are still in ROI after window expires or video ends."""
-    global _GLOBAL_FRAME_IDX, _FPS_ASSUMED
+    Args:
+        video_path: Path to video file
+        analyze_every_n: Analyze every N frames (reuse last annotation otherwise)
+        max_width: Maximum frame width for processing
+        roi_size: ROI size as fraction (0.0-1.0)
     
-    tracks_to_flush = []
-    for tid, track in list(_TRACKS.items()):
-        # Check if track has entered ROI but hasn't exited yet
-        if "enter_time" in track and track.get("inside", False):
-            # Set exit time to current frame
-            track["exit_time"] = _GLOBAL_FRAME_IDX / _FPS_ASSUMED / 60.0  # minutes
-            track["inside"] = False
-            tracks_to_flush.append((tid, track.copy()))  # Copy to avoid modification during iteration
-        # Also check inactive tracks that might have entered but weren't detected exiting
-        elif "enter_time" in track and "exit_time" not in track:
-            # Track entered ROI but never exited - flush it now
-            track["exit_time"] = _GLOBAL_FRAME_IDX / _FPS_ASSUMED / 60.0  # minutes
-            track["inside"] = False
-            tracks_to_flush.append((tid, track.copy()))
-    
-    for tid, track in tracks_to_flush:
-        _write_track_to_csv(tid, track)
-
-
-def _accumulate_roi(tid: int, inside: bool, det: Dict[str, Any]) -> None:
-    """Accumulate ROI data for a track."""
-    global _GLOBAL_FRAME_IDX, _FPS_ASSUMED
-    
-    if tid not in _TRACKS:
-        return
-    
-    track = _TRACKS[tid]
-    was_inside = track.get("inside", False)
-    
-    if inside:
-        if not was_inside:
-            # Just entered ROI - record entry time
-            # time = frames / fps / 60 (to get minutes)
-            track["enter_time"] = _GLOBAL_FRAME_IDX / _FPS_ASSUMED / 60.0
-            track["frames_in"] = 0
-            track["inside"] = True
-            # Initialize attribute lists if not exists
-            if "ages" not in track:
-                track["ages"] = []
-                track["genders"] = []
-                track["races"] = []
-                track["emotions"] = []
-        
-        # Track is inside ROI - accumulate data
-        track["frames_in"] = track.get("frames_in", 0) + 1
-        
-        # Update attributes only if detection data is available
-        # Only update if we have new data (not empty dict)
-        if det and det.get("age") is not None:
-            track["ages"].append(float(det["age"]))
-        if det and det.get("gender"):
-            track["genders"].append(str(det["gender"]))
-        if det and det.get("race"):
-            track["races"].append(str(det["race"]))
-        if det and det.get("emotion"):
-            track["emotions"].append(str(det["emotion"]))
-    else:
-        if was_inside:
-            # Just exited ROI - record exit time and write to CSV
-            track["exit_time"] = _GLOBAL_FRAME_IDX / _FPS_ASSUMED / 60.0
-            track["inside"] = False
-            _write_track_to_csv(tid, track)
-            # Clear entry time and attributes for potential re-entry
-            # But keep the track data structure
-            if "enter_time" in track:
-                del track["enter_time"]
-            if "exit_time" in track:
-                del track["exit_time"]
-            track["ages"] = []
-            track["genders"] = []
-            track["races"] = []
-            track["emotions"] = []
-            track["frames_in"] = 0
-
-
-def _write_track_to_csv(tid: int, track: Dict[str, Any]) -> None:
-    """Write a completed track to CSV."""
-    global _CSV_PATH, _FPS_ASSUMED
-    
-    if not _CSV_PATH or _ROI_MODE == "none":
-        return
-    
-    if "enter_time" not in track or "exit_time" not in track:
-        return
-    
-    # Calculate values
-    time_input = track["enter_time"]  # already in minutes
-    time_out = track["exit_time"]  # already in minutes
-    time_2 = time_out - time_input  # duration in minutes
-    
-    # Calculate average age
-    if track.get("ages") and len(track["ages"]) > 0:
-        avg_age = sum(track["ages"]) / len(track["ages"])
-    else:
-        avg_age = 0.0
-    
-    # For gender, race, emotion: join unique values with commas if multiple
-    genders = track.get("genders", [])
-    if genders:
-        genders_unique = list(dict.fromkeys(genders))  # Preserve order, remove duplicates
-        genders_str = ",".join(genders_unique) if len(genders_unique) > 1 else genders_unique[0] if genders_unique else ""
-    else:
-        genders_str = ""
-    
-    races = track.get("races", [])
-    if races:
-        races_unique = list(dict.fromkeys(races))  # Preserve order, remove duplicates
-        races_str = ",".join(races_unique) if len(races_unique) > 1 else races_unique[0] if races_unique else ""
-    else:
-        races_str = ""
-    
-    emotions = track.get("emotions", [])
-    if emotions:
-        emotions_unique = list(dict.fromkeys(emotions))  # Preserve order, remove duplicates
-        emotions_str = ",".join(emotions_unique) if len(emotions_unique) > 1 else emotions_unique[0] if emotions_unique else ""
-    else:
-        emotions_str = ""
-    
-    # Write to CSV
-    import csv
-    import os
-    file_exists = os.path.exists(_CSV_PATH) and os.path.getsize(_CSV_PATH) > 0
-    
-    with open(_CSV_PATH, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        # Write header if file is new or empty
-        if not file_exists:
-            writer.writerow(["time_input", "time_out", "track_id", "age", "gender", "race", "emotion", "time_2"])
-        
-        writer.writerow([
-            f"{time_input:.6f}",
-            f"{time_out:.6f}",
-            tid,
-            f"{avg_age:.1f}",
-            genders_str,
-            races_str,
-            emotions_str,
-            f"{time_2:.6f}"
-        ])
-
-
-def set_roi_config(roi_mode: str, csv_path: str, duration_min: int, fps: int) -> None:
-    global _ROI_MODE, _CSV_PATH, _FPS_ASSUMED, _WINDOW_FRAMES, _GLOBAL_FRAME_IDX
-    _ROI_MODE = roi_mode
-    _CSV_PATH = csv_path
-    _FPS_ASSUMED = fps
-    _WINDOW_FRAMES = max(1, duration_min * 60 * fps)
-    _GLOBAL_FRAME_IDX = 0
-
-    # reset tracker
-    global _NEXT_TRACK_ID, _TRACKS
-    _NEXT_TRACK_ID = 1
-    _TRACKS.clear()
-
-    # write header if file not exists
-    if _ROI_MODE != "none" and _CSV_PATH:
-        if not os.path.exists(_CSV_PATH) or os.path.getsize(_CSV_PATH) == 0:
-            with open(_CSV_PATH, "w", encoding="utf-8", newline="") as f:
-                import csv
-                writer = csv.writer(f)
-                writer.writerow(["time_input", "time_out", "track_id", "age", "gender", "race", "emotion", "time_2"])
-
-
-def _ensure_tf_gpu() -> None:
-    global _GPU_READY
-    if _GPU_READY:
-        return
-    # Prefer graceful memory growth to avoid pre-allocating full VRAM
-    os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
-    os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
-    try:
-        import tensorflow as tf  # type: ignore
-        gpus = tf.config.list_physical_devices("GPU")
-        for gpu in gpus:
-            try:
-                tf.config.experimental.set_memory_growth(gpu, True)  # type: ignore
-            except Exception:
-                pass
-        # Optional XLA; keep conservative to avoid surprises
-        try:
-            tf.config.optimizer.set_jit(False)  # type: ignore
-        except Exception:
-            pass
-    except Exception:
-        # If TF not available, proceed silently (DeepFace may still use PyTorch)
-        pass
-    _GPU_READY = True
-
-
-def analyze_frame(frame_bgr: np.ndarray, roi_size: float = 0.65) -> np.ndarray:
-    """Run YOLOv11 for person tracking and DeepFace for face attributes.
-    
-    Uses YOLOv11 to track people continuously, and DeepFace to analyze faces
-    inside the ROI for age, gender, race, and emotion.
+    Yields:
+        Annotated frames in RGB format
     """
-    global _GLOBAL_FRAME_IDX, _TRACKS, _TRAILS, _DEEPFACE_CACHE, _LAST_DEEPFACE_FRAME, _DEEPFACE_FRAME_SKIP, _DEEPFACE_CACHE_AGE
-    
-    # Initialize YOLOv11 model if not already done
-    _init_yolo_model()
-    
-    # GPU/TF setup for DeepFace (no-op on subsequent calls)
-    _ensure_tf_gpu()
-    
-    # Optimization: Only convert to RGB when needed (DeepFace)
-    # Check if we'll run DeepFace before converting
-    will_run_deepface = (_GLOBAL_FRAME_IDX - _LAST_DEEPFACE_FRAME) >= _DEEPFACE_FRAME_SKIP
-    
-    annotated = frame_bgr.copy()
-    # Lazy RGB conversion: only convert when DeepFace will run
-    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) if will_run_deepface else None
-    
-    # Compute ROI rectangle
-    h_img, w_img = annotated.shape[:2]
-    rw = int(roi_size * w_img)
-    rh = int(roi_size * h_img)
-    rx0 = (w_img - rw) // 2
-    ry0 = (h_img - rh) // 2
-    rx1 = rx0 + rw
-    ry1 = ry0 + rh
-    
-    # Step 1: Use YOLOv11 to detect and track persons (class 0 in COCO)
-    yolo_tracks: Dict[int, Dict[str, Any]] = {}  # track_id -> {bbox, conf, inside_roi}
-    
-    if _YOLO_MODEL is not None:
-        try:
-            # Run YOLOv11 tracking (persist=True maintains IDs across frames)
-            # Lower confidence threshold to detect smaller/distant persons
-            results = _YOLO_MODEL.track(
-                frame_bgr,
-                persist=True,
-                classes=[0],  # Only detect persons (class 0)
-                conf=0.15,    # Confidence threshold (0.0-1.0): lower = more detections, higher = more precision
-                iou=0.45,     # IoU threshold for NMS (Non-Maximum Suppression): lower = fewer overlapping boxes
-                verbose=False
-            )
-            
-            if results and len(results) > 0:
-                result = results[0]
-                if result.boxes is not None and result.boxes.id is not None:
-                    boxes = result.boxes
-                    # Process each tracked person
-                    for i in range(len(boxes)):
-                        track_id = int(boxes.id[i].item())
-                        box = boxes.xyxy[i].cpu().numpy()  # [x1, y1, x2, y2]
-                        conf = float(boxes.conf[i].item())
-                        
-                        x1, y1, x2, y2 = box
-                        x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
-                        cx, cy = x + w // 2, y + h // 2
-                        
-                        # Check if center is inside ROI
-                        inside_roi = (rx0 <= cx <= rx1) and (ry0 <= cy <= ry1)
-                        
-                        yolo_tracks[track_id] = {
-                            "bbox": (x, y, w, h),
-                            "bbox_xyxy": box.tolist(),
-                            "conf": conf,
-                            "inside_roi": inside_roi,
-                            "center": (cx, cy)
-                        }
-        except Exception as e:
-            print(f"YOLOv11 tracking error: {e}")
-    
-    # Step 2: Optimized DeepFace processing with caching and throttling
-    deepface_results: Dict[int, Dict[str, Any]] = {}  # track_id -> attributes
-    deepface_full_roi_results: List[Dict[str, Any]] = []
-    
-    # Throttle DeepFace: only run every N frames for performance
-    should_run_deepface = (_GLOBAL_FRAME_IDX - _LAST_DEEPFACE_FRAME) >= _DEEPFACE_FRAME_SKIP
-    
-    if should_run_deepface:
-        _LAST_DEEPFACE_FRAME = _GLOBAL_FRAME_IDX
-        
-        # Clean old cache entries
-        tracks_to_remove_from_cache = []
-        for cached_tid, cached_data in _DEEPFACE_CACHE.items():
-            if cached_data.get("frame", 0) < _GLOBAL_FRAME_IDX - _DEEPFACE_CACHE_AGE:
-                tracks_to_remove_from_cache.append(cached_tid)
-        for tid in tracks_to_remove_from_cache:
-            del _DEEPFACE_CACHE[tid]
-        
-        # Strategy: Run DeepFace on entire ROI once (more efficient than per-track)
-        # This detects all faces, including small ones YOLO might miss
-        if frame_rgb is None:
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        roi_frame = frame_rgb[ry0:ry1, rx0:rx1] if (ry1 > ry0 and rx1 > rx0) else frame_rgb
-        
-        try:
-            # Single DeepFace call on ROI (more efficient than multiple per-track calls)
-            df_roi_results = DeepFace.analyze(
-                roi_frame,
-            actions=["age", "gender", "race", "emotion"],
-            enforce_detection=False,
-            align=True,
-            detector_backend="retinaface",
-                silent=True
-            )
-            
-            if isinstance(df_roi_results, dict):
-                df_roi_results = [df_roi_results]
-            
-            # Process DeepFace results and match to YOLO tracks
-            for res in df_roi_results or []:
-                region = res.get("region") or {}
-                df_x = int(region.get("x", region.get("left", 0)))
-                df_y = int(region.get("y", region.get("top", 0)))
-                df_w = int(region.get("w", region.get("width", 0) or 0))
-                df_h = int(region.get("h", region.get("height", 0) or 0))
-                
-                if df_w == 0 and "right" in region and "left" in region:
-                    df_w = int(region["right"]) - int(region.get("left", 0))
-                if df_h == 0 and "bottom" in region and "top" in region:
-                    df_h = int(region["bottom"]) - int(region.get("top", 0))
-                
-                if df_w > 0 and df_h > 0:
-                    # Adjust coordinates to full frame if we analyzed ROI region
-                    if roi_frame is not frame_rgb:
-                        df_x += rx0
-                        df_y += ry0
-                    
-                    df_cx, df_cy = df_x + df_w // 2, df_y + df_h // 2
-                    df_bbox_xyxy = [df_x, df_y, df_x + df_w, df_y + df_h]
-                    
-                    # Try to match this DeepFace detection to a YOLO track
-                    # Use very permissive matching to ensure we always find the best match
-                    best_track_id = None
-                    best_score = -1.0  # Start negative to ensure any valid match is found
-                    
-                    for track_id, yolo_track in yolo_tracks.items():
-                        if not yolo_track["inside_roi"]:
-                            continue
-                        
-                        yx, yy, yw, yh = yolo_track["bbox"]
-                        yolo_bbox_xyxy = [yx, yy, yx + yw, yy + yh]
-                        yolo_cx, yolo_cy = yolo_track["center"]
-                        
-                        # Calculate IoU
-                        xi1 = max(df_bbox_xyxy[0], yolo_bbox_xyxy[0])
-                        yi1 = max(df_bbox_xyxy[1], yolo_bbox_xyxy[1])
-                        xi2 = min(df_bbox_xyxy[2], yolo_bbox_xyxy[2])
-                        yi2 = min(df_bbox_xyxy[3], yolo_bbox_xyxy[3])
-                        
-                        iou = 0.0
-                        if xi2 > xi1 and yi2 > yi1:
-                            inter_area = (xi2 - xi1) * (yi2 - yi1)
-                            df_area = df_w * df_h
-                            yolo_area = yw * yh
-                            union_area = df_area + yolo_area - inter_area
-                            iou = inter_area / union_area if union_area > 0 else 0.0
-                        
-                        # Calculate center distance
-                        center_dist = ((df_cx - yolo_cx) ** 2 + (df_cy - yolo_cy) ** 2) ** 0.5
-                        
-                        # More permissive distance threshold: allow up to 1.5x the face size
-                        max_allowed_dist = max(df_w, df_h) * 1.5
-                        
-                        # Combined score: prioritize IoU but also consider proximity
-                        # Normalize distance to [0, 1] range for scoring
-                        distance_score = 1.0 - min(center_dist / max_allowed_dist, 1.0) if max_allowed_dist > 0 else 0.0
-                        score = iou * 2.0 + distance_score * 1.0
-                        
-                        # Accept match if: IoU > 0.05 OR center distance is reasonable
-                        # This ensures we always find a match for faces inside ROI
-                        if (iou > 0.05 or center_dist < max_allowed_dist) and score > best_score:
-                            best_score = score
-                            best_track_id = track_id
-                    
-                    # Extract all attributes from DeepFace result
-                    # DeepFace can return attributes in different formats
-                    age_val = res.get("age")
-                    gender_val = res.get("dominant_gender") or res.get("gender") or ""
-                    race_val = res.get("dominant_race") or res.get("race") or ""
-                    emotion_val = res.get("dominant_emotion") or res.get("emotion") or ""
-                    
-                    # Ensure we have valid values
-                    if age_val is None:
-                        # Try alternative keys
-                        age_val = res.get("age_estimate") or res.get("estimated_age")
-                    
-                    df_attrs = {
-                        "bbox": (df_x, df_y, df_w, df_h),
-                        "age": age_val,
-                        "gender": str(gender_val).strip() if gender_val else None,
-                        "race": str(race_val).strip() if race_val else None,
-                        "emotion": str(emotion_val).strip() if emotion_val else None,
-                    }
-                    
-                    if best_track_id is not None:
-                        # Match found: associate with YOLO track
-                        # Important: Update existing entry if present, don't overwrite
-                        if best_track_id not in deepface_results:
-                            deepface_results[best_track_id] = df_attrs
-                        else:
-                            # Merge: keep existing, but update with new values if they exist
-                            existing = deepface_results[best_track_id]
-                            deepface_results[best_track_id] = {
-                                "bbox": df_attrs.get("bbox", existing.get("bbox")),
-                                "age": df_attrs.get("age") if df_attrs.get("age") is not None else existing.get("age"),
-                                "gender": df_attrs.get("gender") if df_attrs.get("gender") else existing.get("gender"),
-                                "race": df_attrs.get("race") if df_attrs.get("race") else existing.get("race"),
-                                "emotion": df_attrs.get("emotion") if df_attrs.get("emotion") else existing.get("emotion"),
-                            }
-                        
-                        # Update cache with fresh results
-                        _DEEPFACE_CACHE[best_track_id] = {
-                            **deepface_results[best_track_id],
-                            "frame": _GLOBAL_FRAME_IDX
-                        }
-                    else:
-                        # No match: standalone DeepFace detection (small face YOLO missed)
-                        deepface_full_roi_results.append(df_attrs)
-        except Exception:
-            # DeepFace failed, continue with cached results
-            pass
-    
-    # IMPORTANT: Also populate deepface_results from cache for tracks that are in ROI
-    # This ensures we accumulate attributes even on frames where DeepFace doesn't run
-    if not should_run_deepface:
-        # On skipped frames, use cache for tracks in ROI
-        for track_id, yolo_track in yolo_tracks.items():
-            if yolo_track["inside_roi"] and track_id not in deepface_results:
-                if track_id in _DEEPFACE_CACHE:
-                    cached = _DEEPFACE_CACHE[track_id]
-                    # Use cache if not too old
-                    if cached.get("frame", 0) >= _GLOBAL_FRAME_IDX - _DEEPFACE_CACHE_AGE:
-                        deepface_results[track_id] = {
-                            "age": cached.get("age"),
-                            "gender": cached.get("gender"),
-                            "race": cached.get("race"),
-                            "emotion": cached.get("emotion"),
-                        }
-    
-    # Fallback: If a track is in ROI but has no DeepFace results, try to match with standalone detections
-    for track_id, yolo_track in yolo_tracks.items():
-        if yolo_track["inside_roi"] and track_id not in deepface_results and deepface_full_roi_results:
-            # Find closest DeepFace detection to this track
-            yx, yy, yw, yh = yolo_track["bbox"]
-            yolo_cx, yolo_cy = yolo_track["center"]
-            
-            best_match = None
-            best_dist = float('inf')
-            
-            for df_det in deepface_full_roi_results:
-                df_x, df_y, df_w, df_h = df_det["bbox"]
-                df_cx, df_cy = df_x + df_w // 2, df_y + df_h // 2
-                center_dist = ((df_cx - yolo_cx) ** 2 + (df_cy - yolo_cy) ** 2) ** 0.5
-                
-                # Use reasonable distance threshold: 2x the average size
-                max_dist = (yw + yh) / 2 * 2.0
-                if center_dist < max_dist and center_dist < best_dist:
-                    best_dist = center_dist
-                    best_match = df_det
-            
-            if best_match is not None:
-                # Associate this DeepFace detection with the track
-                deepface_results[track_id] = {
-                    "age": best_match.get("age"),
-                    "gender": best_match.get("gender"),
-                    "race": best_match.get("race"),
-                    "emotion": best_match.get("emotion"),
-                }
-                # Update cache
-                _DEEPFACE_CACHE[track_id] = {
-                    **deepface_results[track_id],
-                    "frame": _GLOBAL_FRAME_IDX
-                }
-    
-    
-    # Step 3: Update global track storage and ROI tracking
-    # Update or create tracks from YOLOv11 results
-    current_track_ids = set()
-    
-    for track_id, yolo_track in yolo_tracks.items():
-        current_track_ids.add(track_id)
-        
-        # Update or create track
-        if track_id not in _TRACKS:
-            _TRACKS[track_id] = {
-                "bbox": yolo_track["bbox"],
-                "ages": [],
-                "genders": [],
-                "races": [],
-                "emotions": [],
-                "inside": False,
-                "frames_in": 0,
-            }
-            # Initialize trail
-            _TRAILS[track_id] = deque(maxlen=_MAX_TRAIL_LENGTH)
-        
-        track = _TRACKS[track_id]
-        track["bbox"] = yolo_track["bbox"]
-        track["last_seen"] = _GLOBAL_FRAME_IDX
-        
-        # Update trail with center position
-        cx, cy = yolo_track["center"]
-        _TRAILS[track_id].append((cx, cy))
-        
-        # Process ROI tracking
-        inside_roi = yolo_track["inside_roi"]
-        was_inside = track.get("inside", False)
-        
-        # Get DeepFace attributes if available (from fresh results or cache)
-        df_attrs = deepface_results.get(track_id, {})
-        
-        if inside_roi:
-            if not was_inside:
-                # Just entered ROI
-                track["enter_time"] = _GLOBAL_FRAME_IDX / _FPS_ASSUMED / 60.0
-                track["frames_in"] = 0
-                track["inside"] = True
-                track["ages"] = []
-                track["genders"] = []
-                track["races"] = []
-                track["emotions"] = []
-            
-            track["frames_in"] = track.get("frames_in", 0) + 1
-            
-            # Accumulate DeepFace attributes when available
-            # CRITICAL: Always try to accumulate if we have any attributes
-            # This ensures data is saved even if some attributes are missing
-            if df_attrs:
-                # Age: append if available and valid
-                age_val = df_attrs.get("age")
-                if age_val is not None:
-                    try:
-                        age_float = float(age_val)
-                        if age_float > 0:  # Only append valid ages
-                            track["ages"].append(age_float)
-                    except (ValueError, TypeError):
-                        pass
-                
-                # Gender: append if available and not empty
-                gender_val = df_attrs.get("gender")
-                if gender_val and str(gender_val).strip():
-                    track["genders"].append(str(gender_val).strip())
-                
-                # Race: append if available and not empty
-                race_val = df_attrs.get("race")
-                if race_val and str(race_val).strip():
-                    track["races"].append(str(race_val).strip())
-                
-                # Emotion: append if available and not empty
-                emotion_val = df_attrs.get("emotion")
-                if emotion_val and str(emotion_val).strip():
-                    track["emotions"].append(str(emotion_val).strip())
-        else:
-            if was_inside:
-                # Just exited ROI
-                track["exit_time"] = _GLOBAL_FRAME_IDX / _FPS_ASSUMED / 60.0
-                track["inside"] = False
-                _write_track_to_csv(track_id, track)
-                # Clear for potential re-entry
-                if "enter_time" in track:
-                    del track["enter_time"]
-                if "exit_time" in track:
-                    del track["exit_time"]
-                track["ages"] = []
-                track["genders"] = []
-                track["races"] = []
-                track["emotions"] = []
-                track["frames_in"] = 0
-    
-    # Remove old tracks (not seen in current frame)
-    tracks_to_remove = []
-    for track_id in list(_TRACKS.keys()):
-        if track_id not in current_track_ids:
-            # Track disappeared - if inside ROI, flush it
-            if _TRACKS[track_id].get("inside", False):
-                track = _TRACKS[track_id]
-                track["exit_time"] = _GLOBAL_FRAME_IDX / _FPS_ASSUMED / 60.0
-                track["inside"] = False
-                _write_track_to_csv(track_id, track)
-                # Clear for potential re-entry
-                if "enter_time" in track:
-                    del track["enter_time"]
-                if "exit_time" in track:
-                    del track["exit_time"]
-            tracks_to_remove.append(track_id)
-    
-    for track_id in tracks_to_remove:
-        if track_id in _TRACKS:
-            del _TRACKS[track_id]
-        if track_id in _TRAILS:
-            del _TRAILS[track_id]
-    
-    # Step 4: Draw everything
-    # Draw trails first (so boxes appear on top)
-    for track_id, trail in _TRAILS.items():
-        if track_id not in yolo_tracks:
-            continue
-        
-        # Draw trail as connected lines
-        if len(trail) > 1:
-            points = list(trail)
-            for i in range(1, len(points)):
-                pt1 = points[i - 1]
-                pt2 = points[i]
-                # Use gradient color - newer points brighter
-                alpha = i / len(points)
-                color_intensity = int(255 * alpha)
-                cv2.line(annotated, pt1, pt2, (color_intensity, color_intensity, 255), 2)
-    
-    # Draw YOLOv11 tracks (cyan for all tracks)
-    num_tracks = 0
-    for track_id, yolo_track in yolo_tracks.items():
-        x, y, w, h = yolo_track["bbox"]
-        
-        # Draw track box in cyan
-        color = (255, 255, 0)  # Cyan in BGR
-        cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
-        cv2.putText(annotated, f"ID: {track_id}", (x, y - 15),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
-        num_tracks += 1
-        
-        # If inside ROI and has DeepFace attributes, draw them
-        if yolo_track["inside_roi"] and track_id in deepface_results:
-            df_attrs = deepface_results[track_id]
-            age = df_attrs.get("age")
-            gender = df_attrs.get("gender")
-            race = df_attrs.get("race")
-            emotion = df_attrs.get("emotion")
-            
-            elapsed_txt = ""
-            if track_id in _TRACKS and "enter_time" in _TRACKS[track_id]:
-                frames_in = _TRACKS[track_id].get("frames_in", 0)
-                elapsed_txt = f" • {frames_in / max(1, _FPS_ASSUMED):.1f}s"
-            
-            label = f"age: {age}  gender: {gender}  race: {race}  emotion: {emotion}{elapsed_txt}"
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            y_text = max(0, y - 35)
-            cv2.rectangle(annotated, (x, max(0, y_text - th - 4)), (x + tw + 6, y_text + 2), (0, 0, 0), -1)
-            cv2.putText(annotated, label, (x + 3, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-
-    # Draw DeepFace detections (green boxes for faces detected by DeepFace in ROI)
-    num_deepface = 0
-    for df_det in deepface_full_roi_results:
-        df_x, df_y, df_w, df_h = df_det["bbox"]
-        # Draw DeepFace detection box in green
-        cv2.rectangle(annotated, (df_x, df_y), (df_x + df_w, df_y + df_h), (0, 255, 0), 2)
-        num_deepface += 1
-        
-        # Draw DeepFace attributes
-        age = df_det.get("age")
-        gender = df_det.get("gender")
-        race = df_det.get("race")
-        emotion = df_det.get("emotion")
-        
-        label = f"DF: age:{age} g:{gender} r:{race} e:{emotion}"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-        y_text = max(0, df_y - 10)
-        cv2.rectangle(annotated, (df_x, max(0, y_text - th - 4)), (df_x + tw + 6, y_text + 2), (0, 0, 0), -1)
-        cv2.putText(annotated, label, (df_x + 3, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
-
-    # Status text
-    status_text = f"tracks: {num_tracks} | DeepFace: {num_deepface}"
-    cv2.putText(annotated, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
-    if num_tracks == 0 and num_deepface == 0:
-        cv2.putText(annotated, "No persons detected", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-    
-    # Draw ROI rectangle
-    cv2.rectangle(annotated, (rx0, ry0), (rx1, ry1), (0, 0, 255), 2)
-    
-    # Window flush
-    if _ROI_MODE != "none" and _WINDOW_FRAMES > 0 and _GLOBAL_FRAME_IDX >= _WINDOW_FRAMES:
-        _flush_window()
-    
-    return annotated
-
-
-def stream_generator(video_path: str, analyze_every_n: int = 10, max_width: int = 640, roi_size: float = 0.65) -> Generator[np.ndarray, None, None]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"No se pudo abrir el video: {video_path}")
+    
     try:
-        # small buffer to reduce latency
+        # Small buffer to reduce latency
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
         except Exception:
             pass
+        
         frame_idx = 0
         last_annotated: Optional[np.ndarray] = None
-        global _GLOBAL_FRAME_IDX, _FPS_ASSUMED
         
         while True:
             ok, frame = cap.read()
             if not ok:
                 # Video ended - flush any remaining tracks in ROI
-                if _ROI_MODE != "none":
-                    _flush_window()
+                if config.ROI_MODE != "none":
+                    flush_window()
                 break
-
+            
             # Resize for speed, preserve aspect ratio
             h, w = frame.shape[:2]
             if w > max_width:
@@ -766,10 +59,10 @@ def stream_generator(video_path: str, analyze_every_n: int = 10, max_width: int 
                 frame_small = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
             else:
                 frame_small = frame
-
+            
             # Increment global frame counter for each frame (for accurate time tracking)
-            _GLOBAL_FRAME_IDX += 1
-
+            config.GLOBAL_FRAME_IDX += 1
+            
             # Analyze every N frames; reuse last annotation otherwise for smoothness
             if frame_idx % analyze_every_n == 0 or last_annotated is None:
                 annotated_small = analyze_frame(frame_small, roi_size=roi_size)
@@ -781,27 +74,44 @@ def stream_generator(video_path: str, analyze_every_n: int = 10, max_width: int 
                 last_annotated = annotated
             else:
                 annotated = last_annotated
-
+            
             frame_idx += 1
-
             annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
             yield annotated_rgb
+    
     finally:
         # Final flush of any remaining tracks in ROI when stream ends
-        if _ROI_MODE != "none":
-            # Force flush all tracks that have entered ROI but haven't exited
-            _flush_window()
+        if config.ROI_MODE != "none":
+            flush_window()
             # Additional check: flush any tracks with enter_time but no exit_time
-            for tid, track in list(_TRACKS.items()):
+            for tid, track in list(config.TRACKS.items()):
                 if "enter_time" in track and "exit_time" not in track:
-                    track["exit_time"] = _GLOBAL_FRAME_IDX / _FPS_ASSUMED / 60.0
+                    track["exit_time"] = config.GLOBAL_FRAME_IDX / config.FPS_ASSUMED / 60.0
                     track["inside"] = False
-                    _write_track_to_csv(tid, track)
+                    write_track_to_csv(tid, track)
         cap.release()
 
 
-def build_demo(default_video: str, roi_mode: str = "consolidated", csv_path: str = "", duration_min: int = 30, fps: int = 22) -> gr.Blocks:
-    # set ROI configuration - auto-configure CSV path if not provided
+def build_demo(
+    default_video: str,
+    roi_mode: str = "consolidated",
+    csv_path: str = "",
+    duration_min: int = 30,
+    fps: int = 22
+) -> gr.Blocks:
+    """Build Gradio demo interface.
+    
+    Args:
+        default_video: Default video path
+        roi_mode: ROI tracking mode
+        csv_path: Path to CSV output file
+        duration_min: Window duration in minutes
+        fps: Assumed frames per second
+    
+    Returns:
+        Gradio Blocks interface
+    """
+    # Set ROI configuration - auto-configure CSV path if not provided
     if not csv_path:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         csv_path = os.path.join(base_dir, "roi_stats.csv")
@@ -820,15 +130,15 @@ def build_demo(default_video: str, roi_mode: str = "consolidated", csv_path: str
         )
         output = gr.Image(label="Stream", streaming=True, type="numpy")
         start_btn = gr.Button("Iniciar")
-
+        
         def start(vpath: str, roi_size: float) -> Generator[np.ndarray, None, None]:
             # Reset ROI config for new video
             set_roi_config(roi_mode=roi_mode, csv_path=csv_path, duration_min=duration_min, fps=fps)
             # Stream with throttled DeepFace analysis for smoother playback
             yield from stream_generator(vpath, analyze_every_n=10, max_width=640, roi_size=roi_size)
-
+        
         start_btn.click(fn=start, inputs=[path_in, roi_size_slider], outputs=output)
-
+    
     # Warm-up: run a quick analyze on first frame to load models
     try:
         cap = cv2.VideoCapture(default_video)
@@ -838,7 +148,7 @@ def build_demo(default_video: str, roi_mode: str = "consolidated", csv_path: str
         cap.release()
     except Exception:
         pass
-
+    
     return demo
 
 
@@ -848,5 +158,3 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "7860"))
     demo = build_demo(default_path)
     demo.queue().launch(server_name="0.0.0.0", server_port=port, share=True)
-
-
