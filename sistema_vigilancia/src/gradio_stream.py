@@ -28,6 +28,12 @@ _TRAILS: Dict[int, deque] = {}  # track_id -> deque of (x, y) positions for trai
 _MAX_TRAIL_LENGTH: int = 50  # Maximum points in trail
 _LEAVE_TOL: int = 5  # visits mode tolerance
 
+# Optimization: DeepFace throttling and caching
+_DEEPFACE_FRAME_SKIP: int = 1  # Run DeepFace every frame (set to 1 for full data collection)
+_LAST_DEEPFACE_FRAME: int = -1  # Last frame where DeepFace was executed
+_DEEPFACE_CACHE: Dict[int, Dict[str, Any]] = {}  # Cache DeepFace results per track_id
+_DEEPFACE_CACHE_AGE: int = 5  # Frames before cache expires
+
 
 def _init_yolo_model() -> None:
     """Initialize YOLOv11 model for person tracking."""
@@ -257,7 +263,7 @@ def analyze_frame(frame_bgr: np.ndarray, roi_size: float = 0.65) -> np.ndarray:
     Uses YOLOv11 to track people continuously, and DeepFace to analyze faces
     inside the ROI for age, gender, race, and emotion.
     """
-    global _GLOBAL_FRAME_IDX, _TRACKS, _TRAILS
+    global _GLOBAL_FRAME_IDX, _TRACKS, _TRAILS, _DEEPFACE_CACHE, _LAST_DEEPFACE_FRAME, _DEEPFACE_FRAME_SKIP, _DEEPFACE_CACHE_AGE
     
     # Initialize YOLOv11 model if not already done
     _init_yolo_model()
@@ -265,8 +271,13 @@ def analyze_frame(frame_bgr: np.ndarray, roi_size: float = 0.65) -> np.ndarray:
     # GPU/TF setup for DeepFace (no-op on subsequent calls)
     _ensure_tf_gpu()
     
+    # Optimization: Only convert to RGB when needed (DeepFace)
+    # Check if we'll run DeepFace before converting
+    will_run_deepface = (_GLOBAL_FRAME_IDX - _LAST_DEEPFACE_FRAME) >= _DEEPFACE_FRAME_SKIP
+    
     annotated = frame_bgr.copy()
-    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    # Lazy RGB conversion: only convert when DeepFace will run
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) if will_run_deepface else None
     
     # Compute ROI rectangle
     h_img, w_img = annotated.shape[:2]
@@ -288,7 +299,8 @@ def analyze_frame(frame_bgr: np.ndarray, roi_size: float = 0.65) -> np.ndarray:
                 frame_bgr,
                 persist=True,
                 classes=[0],  # Only detect persons (class 0)
-                conf=0.15,    # Lower confidence threshold for better small person detection
+                conf=0.15,    # Confidence threshold (0.0-1.0): lower = more detections, higher = more precision
+                iou=0.45,     # IoU threshold for NMS (Non-Maximum Suppression): lower = fewer overlapping boxes
                 verbose=False
             )
             
@@ -319,99 +331,210 @@ def analyze_frame(frame_bgr: np.ndarray, roi_size: float = 0.65) -> np.ndarray:
         except Exception as e:
             print(f"YOLOv11 tracking error: {e}")
     
-    # Step 2: For persons inside ROI, extract face region and run DeepFace
-    # Update track data with DeepFace attributes
+    # Step 2: Optimized DeepFace processing with caching and throttling
     deepface_results: Dict[int, Dict[str, Any]] = {}  # track_id -> attributes
-    
-    for track_id, yolo_track in yolo_tracks.items():
-        if not yolo_track["inside_roi"]:
-            continue
-        
-        x, y, w, h = yolo_track["bbox"]
-        # Extract face region (expand a bit for better detection)
-        face_margin = 20
-        face_x = max(0, x - face_margin)
-        face_y = max(0, y - face_margin)
-        face_w = min(w_img - face_x, w + 2 * face_margin)
-        face_h = min(h_img - face_y, h + 2 * face_margin)
-        
-        if face_w > 0 and face_h > 0:
-            face_roi = frame_rgb[face_y:face_y + face_h, face_x:face_x + face_w]
-            
-            try:
-                # Run DeepFace on face region
-                df_results = DeepFace.analyze(
-                    face_roi,
-                    actions=["age", "gender", "race", "emotion"],
-                    enforce_detection=False,
-                    align=True,
-                    detector_backend="retinaface",
-                    silent=True
-                )
-                
-                if isinstance(df_results, dict):
-                    df_results = [df_results]
-                
-                if df_results and len(df_results) > 0:
-                    res = df_results[0]
-                    deepface_results[track_id] = {
-                        "age": res.get("age"),
-                        "gender": res.get("dominant_gender") or res.get("gender"),
-                        "race": res.get("dominant_race") or res.get("race"),
-                        "emotion": res.get("dominant_emotion") or res.get("emotion"),
-                    }
-            except Exception:
-                # DeepFace failed for this face, continue
-                pass
-    
-    # Step 2b: Also run DeepFace on entire ROI to detect small faces that YOLO might miss
-    # This helps detect faces that are too small for YOLO but visible to DeepFace
     deepface_full_roi_results: List[Dict[str, Any]] = []
-    roi_frame = frame_rgb[ry0:ry1, rx0:rx1] if (ry1 > ry0 and rx1 > rx0) else frame_rgb
     
-    try:
-        # Run DeepFace on entire ROI region for better face detection
-        df_roi_results = DeepFace.analyze(
-            roi_frame,
+    # Throttle DeepFace: only run every N frames for performance
+    should_run_deepface = (_GLOBAL_FRAME_IDX - _LAST_DEEPFACE_FRAME) >= _DEEPFACE_FRAME_SKIP
+    
+    if should_run_deepface:
+        _LAST_DEEPFACE_FRAME = _GLOBAL_FRAME_IDX
+        
+        # Clean old cache entries
+        tracks_to_remove_from_cache = []
+        for cached_tid, cached_data in _DEEPFACE_CACHE.items():
+            if cached_data.get("frame", 0) < _GLOBAL_FRAME_IDX - _DEEPFACE_CACHE_AGE:
+                tracks_to_remove_from_cache.append(cached_tid)
+        for tid in tracks_to_remove_from_cache:
+            del _DEEPFACE_CACHE[tid]
+        
+        # Strategy: Run DeepFace on entire ROI once (more efficient than per-track)
+        # This detects all faces, including small ones YOLO might miss
+        if frame_rgb is None:
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        roi_frame = frame_rgb[ry0:ry1, rx0:rx1] if (ry1 > ry0 and rx1 > rx0) else frame_rgb
+        
+        try:
+            # Single DeepFace call on ROI (more efficient than multiple per-track calls)
+            df_roi_results = DeepFace.analyze(
+                roi_frame,
             actions=["age", "gender", "race", "emotion"],
             enforce_detection=False,
             align=True,
             detector_backend="retinaface",
-            silent=True
-        )
-        
-        if isinstance(df_roi_results, dict):
-            df_roi_results = [df_roi_results]
-        
-        # Process DeepFace results from ROI
-        for res in df_roi_results or []:
-            region = res.get("region") or {}
-            df_x = int(region.get("x", region.get("left", 0)))
-            df_y = int(region.get("y", region.get("top", 0)))
-            df_w = int(region.get("w", region.get("width", 0) or 0))
-            df_h = int(region.get("h", region.get("height", 0) or 0))
+                silent=True
+            )
             
-            if df_w == 0 and "right" in region and "left" in region:
-                df_w = int(region["right"]) - int(region.get("left", 0))
-            if df_h == 0 and "bottom" in region and "top" in region:
-                df_h = int(region["bottom"]) - int(region.get("top", 0))
+            if isinstance(df_roi_results, dict):
+                df_roi_results = [df_roi_results]
             
-            if df_w > 0 and df_h > 0:
-                # Adjust coordinates to full frame if we analyzed ROI region
-                if roi_frame is not frame_rgb:
-                    df_x += rx0
-                    df_y += ry0
+            # Process DeepFace results and match to YOLO tracks
+            for res in df_roi_results or []:
+                region = res.get("region") or {}
+                df_x = int(region.get("x", region.get("left", 0)))
+                df_y = int(region.get("y", region.get("top", 0)))
+                df_w = int(region.get("w", region.get("width", 0) or 0))
+                df_h = int(region.get("h", region.get("height", 0) or 0))
                 
-                deepface_full_roi_results.append({
-                    "bbox": (df_x, df_y, df_w, df_h),
-                    "age": res.get("age"),
-                    "gender": res.get("dominant_gender") or res.get("gender"),
-                    "race": res.get("dominant_race") or res.get("race"),
-                    "emotion": res.get("dominant_emotion") or res.get("emotion"),
-                })
-    except Exception:
-        # DeepFace failed on ROI, continue
-        pass
+                if df_w == 0 and "right" in region and "left" in region:
+                    df_w = int(region["right"]) - int(region.get("left", 0))
+                if df_h == 0 and "bottom" in region and "top" in region:
+                    df_h = int(region["bottom"]) - int(region.get("top", 0))
+                
+                if df_w > 0 and df_h > 0:
+                    # Adjust coordinates to full frame if we analyzed ROI region
+                    if roi_frame is not frame_rgb:
+                        df_x += rx0
+                        df_y += ry0
+                    
+                    df_cx, df_cy = df_x + df_w // 2, df_y + df_h // 2
+                    df_bbox_xyxy = [df_x, df_y, df_x + df_w, df_y + df_h]
+                    
+                    # Try to match this DeepFace detection to a YOLO track
+                    # Use very permissive matching to ensure we always find the best match
+                    best_track_id = None
+                    best_score = -1.0  # Start negative to ensure any valid match is found
+                    
+                    for track_id, yolo_track in yolo_tracks.items():
+                        if not yolo_track["inside_roi"]:
+                            continue
+                        
+                        yx, yy, yw, yh = yolo_track["bbox"]
+                        yolo_bbox_xyxy = [yx, yy, yx + yw, yy + yh]
+                        yolo_cx, yolo_cy = yolo_track["center"]
+                        
+                        # Calculate IoU
+                        xi1 = max(df_bbox_xyxy[0], yolo_bbox_xyxy[0])
+                        yi1 = max(df_bbox_xyxy[1], yolo_bbox_xyxy[1])
+                        xi2 = min(df_bbox_xyxy[2], yolo_bbox_xyxy[2])
+                        yi2 = min(df_bbox_xyxy[3], yolo_bbox_xyxy[3])
+                        
+                        iou = 0.0
+                        if xi2 > xi1 and yi2 > yi1:
+                            inter_area = (xi2 - xi1) * (yi2 - yi1)
+                            df_area = df_w * df_h
+                            yolo_area = yw * yh
+                            union_area = df_area + yolo_area - inter_area
+                            iou = inter_area / union_area if union_area > 0 else 0.0
+                        
+                        # Calculate center distance
+                        center_dist = ((df_cx - yolo_cx) ** 2 + (df_cy - yolo_cy) ** 2) ** 0.5
+                        
+                        # More permissive distance threshold: allow up to 1.5x the face size
+                        max_allowed_dist = max(df_w, df_h) * 1.5
+                        
+                        # Combined score: prioritize IoU but also consider proximity
+                        # Normalize distance to [0, 1] range for scoring
+                        distance_score = 1.0 - min(center_dist / max_allowed_dist, 1.0) if max_allowed_dist > 0 else 0.0
+                        score = iou * 2.0 + distance_score * 1.0
+                        
+                        # Accept match if: IoU > 0.05 OR center distance is reasonable
+                        # This ensures we always find a match for faces inside ROI
+                        if (iou > 0.05 or center_dist < max_allowed_dist) and score > best_score:
+                            best_score = score
+                            best_track_id = track_id
+                    
+                    # Extract all attributes from DeepFace result
+                    # DeepFace can return attributes in different formats
+                    age_val = res.get("age")
+                    gender_val = res.get("dominant_gender") or res.get("gender") or ""
+                    race_val = res.get("dominant_race") or res.get("race") or ""
+                    emotion_val = res.get("dominant_emotion") or res.get("emotion") or ""
+                    
+                    # Ensure we have valid values
+                    if age_val is None:
+                        # Try alternative keys
+                        age_val = res.get("age_estimate") or res.get("estimated_age")
+                    
+                    df_attrs = {
+                        "bbox": (df_x, df_y, df_w, df_h),
+                        "age": age_val,
+                        "gender": str(gender_val).strip() if gender_val else None,
+                        "race": str(race_val).strip() if race_val else None,
+                        "emotion": str(emotion_val).strip() if emotion_val else None,
+                    }
+                    
+                    if best_track_id is not None:
+                        # Match found: associate with YOLO track
+                        # Important: Update existing entry if present, don't overwrite
+                        if best_track_id not in deepface_results:
+                            deepface_results[best_track_id] = df_attrs
+                        else:
+                            # Merge: keep existing, but update with new values if they exist
+                            existing = deepface_results[best_track_id]
+                            deepface_results[best_track_id] = {
+                                "bbox": df_attrs.get("bbox", existing.get("bbox")),
+                                "age": df_attrs.get("age") if df_attrs.get("age") is not None else existing.get("age"),
+                                "gender": df_attrs.get("gender") if df_attrs.get("gender") else existing.get("gender"),
+                                "race": df_attrs.get("race") if df_attrs.get("race") else existing.get("race"),
+                                "emotion": df_attrs.get("emotion") if df_attrs.get("emotion") else existing.get("emotion"),
+                            }
+                        
+                        # Update cache with fresh results
+                        _DEEPFACE_CACHE[best_track_id] = {
+                            **deepface_results[best_track_id],
+                            "frame": _GLOBAL_FRAME_IDX
+                        }
+                    else:
+                        # No match: standalone DeepFace detection (small face YOLO missed)
+                        deepface_full_roi_results.append(df_attrs)
+        except Exception:
+            # DeepFace failed, continue with cached results
+            pass
+    
+    # IMPORTANT: Also populate deepface_results from cache for tracks that are in ROI
+    # This ensures we accumulate attributes even on frames where DeepFace doesn't run
+    if not should_run_deepface:
+        # On skipped frames, use cache for tracks in ROI
+        for track_id, yolo_track in yolo_tracks.items():
+            if yolo_track["inside_roi"] and track_id not in deepface_results:
+                if track_id in _DEEPFACE_CACHE:
+                    cached = _DEEPFACE_CACHE[track_id]
+                    # Use cache if not too old
+                    if cached.get("frame", 0) >= _GLOBAL_FRAME_IDX - _DEEPFACE_CACHE_AGE:
+                        deepface_results[track_id] = {
+                            "age": cached.get("age"),
+                            "gender": cached.get("gender"),
+                            "race": cached.get("race"),
+                            "emotion": cached.get("emotion"),
+                        }
+    
+    # Fallback: If a track is in ROI but has no DeepFace results, try to match with standalone detections
+    for track_id, yolo_track in yolo_tracks.items():
+        if yolo_track["inside_roi"] and track_id not in deepface_results and deepface_full_roi_results:
+            # Find closest DeepFace detection to this track
+            yx, yy, yw, yh = yolo_track["bbox"]
+            yolo_cx, yolo_cy = yolo_track["center"]
+            
+            best_match = None
+            best_dist = float('inf')
+            
+            for df_det in deepface_full_roi_results:
+                df_x, df_y, df_w, df_h = df_det["bbox"]
+                df_cx, df_cy = df_x + df_w // 2, df_y + df_h // 2
+                center_dist = ((df_cx - yolo_cx) ** 2 + (df_cy - yolo_cy) ** 2) ** 0.5
+                
+                # Use reasonable distance threshold: 2x the average size
+                max_dist = (yw + yh) / 2 * 2.0
+                if center_dist < max_dist and center_dist < best_dist:
+                    best_dist = center_dist
+                    best_match = df_det
+            
+            if best_match is not None:
+                # Associate this DeepFace detection with the track
+                deepface_results[track_id] = {
+                    "age": best_match.get("age"),
+                    "gender": best_match.get("gender"),
+                    "race": best_match.get("race"),
+                    "emotion": best_match.get("emotion"),
+                }
+                # Update cache
+                _DEEPFACE_CACHE[track_id] = {
+                    **deepface_results[track_id],
+                    "frame": _GLOBAL_FRAME_IDX
+                }
+    
     
     # Step 3: Update global track storage and ROI tracking
     # Update or create tracks from YOLOv11 results
@@ -446,7 +569,7 @@ def analyze_frame(frame_bgr: np.ndarray, roi_size: float = 0.65) -> np.ndarray:
         inside_roi = yolo_track["inside_roi"]
         was_inside = track.get("inside", False)
         
-        # Get DeepFace attributes if available
+        # Get DeepFace attributes if available (from fresh results or cache)
         df_attrs = deepface_results.get(track_id, {})
         
         if inside_roi:
@@ -462,15 +585,34 @@ def analyze_frame(frame_bgr: np.ndarray, roi_size: float = 0.65) -> np.ndarray:
             
             track["frames_in"] = track.get("frames_in", 0) + 1
             
-            # Accumulate DeepFace attributes
-            if df_attrs.get("age"):
-                track["ages"].append(float(df_attrs["age"]))
-            if df_attrs.get("gender"):
-                track["genders"].append(str(df_attrs["gender"]))
-            if df_attrs.get("race"):
-                track["races"].append(str(df_attrs["race"]))
-            if df_attrs.get("emotion"):
-                track["emotions"].append(str(df_attrs["emotion"]))
+            # Accumulate DeepFace attributes when available
+            # CRITICAL: Always try to accumulate if we have any attributes
+            # This ensures data is saved even if some attributes are missing
+            if df_attrs:
+                # Age: append if available and valid
+                age_val = df_attrs.get("age")
+                if age_val is not None:
+                    try:
+                        age_float = float(age_val)
+                        if age_float > 0:  # Only append valid ages
+                            track["ages"].append(age_float)
+                    except (ValueError, TypeError):
+                        pass
+                
+                # Gender: append if available and not empty
+                gender_val = df_attrs.get("gender")
+                if gender_val and str(gender_val).strip():
+                    track["genders"].append(str(gender_val).strip())
+                
+                # Race: append if available and not empty
+                race_val = df_attrs.get("race")
+                if race_val and str(race_val).strip():
+                    track["races"].append(str(race_val).strip())
+                
+                # Emotion: append if available and not empty
+                emotion_val = df_attrs.get("emotion")
+                if emotion_val and str(emotion_val).strip():
+                    track["emotions"].append(str(emotion_val).strip())
         else:
             if was_inside:
                 # Just exited ROI
@@ -558,7 +700,7 @@ def analyze_frame(frame_bgr: np.ndarray, roi_size: float = 0.65) -> np.ndarray:
             y_text = max(0, y - 35)
             cv2.rectangle(annotated, (x, max(0, y_text - th - 4)), (x + tw + 6, y_text + 2), (0, 0, 0), -1)
             cv2.putText(annotated, label, (x + 3, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-    
+
     # Draw DeepFace detections (green boxes for faces detected by DeepFace in ROI)
     num_deepface = 0
     for df_det in deepface_full_roi_results:
