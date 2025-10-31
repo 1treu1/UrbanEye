@@ -15,7 +15,7 @@ os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 
 
-def mjpeg_generator(video_path: str, analyze_every_n: int = 1, max_width: int = 720, loop: bool = False) -> Generator[bytes, None, None]:
+def mjpeg_generator(video_path: str, analyze_every_n: int = 1, max_width: int = 720, loop: bool = False, roi_size: float = 0.65) -> Generator[bytes, None, None]:
     cap = cv2.VideoCapture(0 if video_path == "0" else video_path)
     if not cap.isOpened():
         raise RuntimeError(f"No se pudo abrir la fuente: {video_path}")
@@ -42,7 +42,7 @@ def mjpeg_generator(video_path: str, analyze_every_n: int = 1, max_width: int = 
                 frame_small = frame
 
             if frame_idx % analyze_every_n == 0 or last_annotated is None:
-                annotated_small = analyze_frame(frame_small)
+                annotated_small = analyze_frame(frame_small, roi_size=roi_size)
                 if annotated_small.shape[1] != w:
                     annotated = cv2.resize(annotated_small, (w, h), interpolation=cv2.INTER_LINEAR)
                 else:
@@ -115,10 +115,10 @@ def build_app(default_video: str) -> FastAPI:
         )
 
     @app.get("/video_feed")
-    def video_feed(source: str | None = None, loop: int = 0, an: int = 1, mw: int = 720):
+    def video_feed(source: str | None = None, loop: int = 0, an: int = 1, mw: int = 720, roi_size: float = 0.65):
         vsrc = source if source is not None and source != "" else default_video
         return StreamingResponse(
-            mjpeg_generator(vsrc, analyze_every_n=an, max_width=mw, loop=bool(loop)),
+            mjpeg_generator(vsrc, analyze_every_n=an, max_width=mw, loop=bool(loop), roi_size=roi_size),
             media_type="multipart/x-mixed-replace; boundary=frame",
         )
 

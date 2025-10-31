@@ -30,6 +30,12 @@ def parse_args() -> argparse.Namespace:
         default=int(os.getenv("PORT", "7860")),
         help="Puerto HTTP para Gradio (solo si --ui=gradio)",
     )
+    parser.add_argument(
+        "--roi-size",
+        type=float,
+        default=0.65,
+        help="Tamaño del rectángulo ROI como porcentaje (0.0 a 1.0, default 0.65 para 65%)",
+    )
     return parser.parse_args()
 
 
@@ -68,7 +74,7 @@ def main() -> None:
             ok, frame = cap.read()
             if not ok:
                 break
-            annotated = analyze_frame(frame)
+            annotated = analyze_frame(frame, roi_size=args.roi_size)
             cv2.imshow("DeepFace - age/gender/race/emotion", annotated)
             if cv2.waitKey(1) & 0xFF == 27:  # ESC
                 break

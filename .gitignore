@@ -37,7 +37,16 @@ sistema_vigilancia/data/logs/
 # Entornos/IDE
 .idea/
 .vscode/
-
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.ico
+*.webp
+*.heic
+*.mp4
 
 
 
