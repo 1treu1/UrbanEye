@@ -283,11 +283,12 @@ def analyze_frame(frame_bgr: np.ndarray, roi_size: float = 0.65) -> np.ndarray:
     if _YOLO_MODEL is not None:
         try:
             # Run YOLOv11 tracking (persist=True maintains IDs across frames)
+            # Lower confidence threshold to detect smaller/distant persons
             results = _YOLO_MODEL.track(
                 frame_bgr,
                 persist=True,
                 classes=[0],  # Only detect persons (class 0)
-                conf=0.25,    # Confidence threshold
+                conf=0.15,    # Lower confidence threshold for better small person detection
                 verbose=False
             )
             
@@ -362,6 +363,55 @@ def analyze_frame(frame_bgr: np.ndarray, roi_size: float = 0.65) -> np.ndarray:
             except Exception:
                 # DeepFace failed for this face, continue
                 pass
+    
+    # Step 2b: Also run DeepFace on entire ROI to detect small faces that YOLO might miss
+    # This helps detect faces that are too small for YOLO but visible to DeepFace
+    deepface_full_roi_results: List[Dict[str, Any]] = []
+    roi_frame = frame_rgb[ry0:ry1, rx0:rx1] if (ry1 > ry0 and rx1 > rx0) else frame_rgb
+    
+    try:
+        # Run DeepFace on entire ROI region for better face detection
+        df_roi_results = DeepFace.analyze(
+            roi_frame,
+            actions=["age", "gender", "race", "emotion"],
+            enforce_detection=False,
+            align=True,
+            detector_backend="retinaface",
+            silent=True
+        )
+        
+        if isinstance(df_roi_results, dict):
+            df_roi_results = [df_roi_results]
+        
+        # Process DeepFace results from ROI
+        for res in df_roi_results or []:
+            region = res.get("region") or {}
+            df_x = int(region.get("x", region.get("left", 0)))
+            df_y = int(region.get("y", region.get("top", 0)))
+            df_w = int(region.get("w", region.get("width", 0) or 0))
+            df_h = int(region.get("h", region.get("height", 0) or 0))
+            
+            if df_w == 0 and "right" in region and "left" in region:
+                df_w = int(region["right"]) - int(region.get("left", 0))
+            if df_h == 0 and "bottom" in region and "top" in region:
+                df_h = int(region["bottom"]) - int(region.get("top", 0))
+            
+            if df_w > 0 and df_h > 0:
+                # Adjust coordinates to full frame if we analyzed ROI region
+                if roi_frame is not frame_rgb:
+                    df_x += rx0
+                    df_y += ry0
+                
+                deepface_full_roi_results.append({
+                    "bbox": (df_x, df_y, df_w, df_h),
+                    "age": res.get("age"),
+                    "gender": res.get("dominant_gender") or res.get("gender"),
+                    "race": res.get("dominant_race") or res.get("race"),
+                    "emotion": res.get("dominant_emotion") or res.get("emotion"),
+                })
+    except Exception:
+        # DeepFace failed on ROI, continue
+        pass
     
     # Step 3: Update global track storage and ROI tracking
     # Update or create tracks from YOLOv11 results
@@ -508,11 +558,31 @@ def analyze_frame(frame_bgr: np.ndarray, roi_size: float = 0.65) -> np.ndarray:
             y_text = max(0, y - 35)
             cv2.rectangle(annotated, (x, max(0, y_text - th - 4)), (x + tw + 6, y_text + 2), (0, 0, 0), -1)
             cv2.putText(annotated, label, (x + 3, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    
+    # Draw DeepFace detections (green boxes for faces detected by DeepFace in ROI)
+    num_deepface = 0
+    for df_det in deepface_full_roi_results:
+        df_x, df_y, df_w, df_h = df_det["bbox"]
+        # Draw DeepFace detection box in green
+        cv2.rectangle(annotated, (df_x, df_y), (df_x + df_w, df_y + df_h), (0, 255, 0), 2)
+        num_deepface += 1
+        
+        # Draw DeepFace attributes
+        age = df_det.get("age")
+        gender = df_det.get("gender")
+        race = df_det.get("race")
+        emotion = df_det.get("emotion")
+        
+        label = f"DF: age:{age} g:{gender} r:{race} e:{emotion}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+        y_text = max(0, df_y - 10)
+        cv2.rectangle(annotated, (df_x, max(0, y_text - th - 4)), (df_x + tw + 6, y_text + 2), (0, 0, 0), -1)
+        cv2.putText(annotated, label, (df_x + 3, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
 
     # Status text
-    status_text = f"tracks: {num_tracks}"
+    status_text = f"tracks: {num_tracks} | DeepFace: {num_deepface}"
     cv2.putText(annotated, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
-    if num_tracks == 0:
+    if num_tracks == 0 and num_deepface == 0:
         cv2.putText(annotated, "No persons detected", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
     
     # Draw ROI rectangle
