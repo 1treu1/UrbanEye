@@ -1,6 +1,7 @@
 # Entornos virtuales
 .venv/
 venv/
+.venv_/
 
 # Cachés de Python
 __pycache__/
@@ -37,6 +38,19 @@ sistema_vigilancia/data/logs/
 # Entornos/IDE
 .idea/
 .vscode/
+
+# Videos e Imágenes
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
 
 
 
