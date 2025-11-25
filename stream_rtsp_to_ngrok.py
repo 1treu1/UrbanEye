@@ -64,11 +64,11 @@ def start_ffmpeg_stream():
     print(f"   Stream RTSP: {RTSP_URL}")
 
     try:
+        # IMPORTANTE: Usar DEVNULL para evitar que el buffer del pipe se llene y cuelgue el proceso
         process = subprocess.Popen(
             ffmpeg_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
         return process
     except FileNotFoundError:

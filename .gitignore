@@ -52,6 +52,9 @@ sistema_vigilancia/data/logs/
 *.tiff
 *.webp
 
+# Credenciales
+config/*.json
+
 
 
 
