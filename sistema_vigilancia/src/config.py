@@ -11,6 +11,11 @@ FPS_ASSUMED: int = 22
 WINDOW_FRAMES: int = 0
 GLOBAL_FRAME_IDX: int = 0
 
+# Location metadata
+LATITUD: Optional[str] = None
+LONGITUD: Optional[str] = None
+LUGAR: Optional[str] = None
+
 # YOLOv11 tracker
 YOLO_MODEL: Optional[YOLO] = None
 YOLO_MODEL_INITIALIZED: bool = False

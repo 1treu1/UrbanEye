@@ -2,6 +2,7 @@
 
 import os
 import csv
+from datetime import date
 from typing import Dict, Any
 
 import sistema_vigilancia.src.config as config
@@ -31,7 +32,7 @@ def set_roi_config(roi_mode: str, csv_path: str, duration_min: int, fps: int) ->
         if not os.path.exists(config.CSV_PATH) or os.path.getsize(config.CSV_PATH) == 0:
             with open(config.CSV_PATH, "w", encoding="utf-8", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(["time_input", "time_out", "track_id", "age", "gender", "race", "emotion", "time_2"])
+                writer.writerow(["time_input", "time_out", "track_id", "age", "gender", "race", "emotion", "time_2", "date", "latitud", "longitud", "lugar"])
 
 
 def write_track_to_csv(tid: int, track: Dict[str, Any]) -> None:
@@ -86,7 +87,9 @@ def write_track_to_csv(tid: int, track: Dict[str, Any]) -> None:
     with open(config.CSV_PATH, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["time_input", "time_out", "track_id", "age", "gender", "race", "emotion", "time_2"])
+            writer.writerow(["time_input", "time_out", "track_id", "age", "gender", "race", "emotion", "time_2", "date", "latitud", "longitud", "lugar"])
+        
+        current_date = date.today().isoformat()
         
         writer.writerow([
             f"{time_input:.6f}",
@@ -96,7 +99,11 @@ def write_track_to_csv(tid: int, track: Dict[str, Any]) -> None:
             genders_str,
             races_str,
             emotions_str,
-            f"{time_2:.6f}"
+            f"{time_2:.6f}",
+            current_date,
+            config.LATITUD or "",
+            config.LONGITUD or "",
+            config.LUGAR or ""
         ])
 
 

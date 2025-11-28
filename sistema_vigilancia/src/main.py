@@ -36,11 +36,35 @@ def parse_args() -> argparse.Namespace:
         default=0.65,
         help="Tamaño del rectángulo ROI como porcentaje (0.0 a 1.0, default 0.65 para 65%)",
     )
+    parser.add_argument(
+        "--latitud",
+        type=str,
+        default="",
+        help="Latitud de la ubicación de la cámara",
+    )
+    parser.add_argument(
+        "--longitud",
+        type=str,
+        default="",
+        help="Longitud de la ubicación de la cámara",
+    )
+    parser.add_argument(
+        "--lugar",
+        type=str,
+        default="",
+        help="Nombre del lugar/ubicación",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    
+    # Set global config from args
+    from . import config
+    config.LATITUD = args.latitud
+    config.LONGITUD = args.longitud
+    config.LUGAR = args.lugar
 
     # Default to bundled demo video if not provided and UI is gradio
     base_dir = os.path.dirname(os.path.abspath(__file__))
