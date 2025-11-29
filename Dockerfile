@@ -1,11 +1,10 @@
 FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
 
-# 1. EVITAR PREGUNTAS (Solución al bloqueo)
+# 1. Configuración de zona horaria y sistema
 ARG DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
-# 2. Instalar dependencias, PPA, curl y Python 3.12
-# Se añade 'curl' y se elimina 'python3.12-distutils'
+# 2. Instalar dependencias del sistema y Python 3.12
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     tzdata \
@@ -22,20 +21,21 @@ RUN apt-get update && \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. Instalar PIP para Python 3.12 manualmente
-RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
+# 3. CREAR ENTORNO VIRTUAL (VENV)
+# Esto aísla tu código de las librerías viejas del sistema (soluciona lo de blinker)
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3.12 -m venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# 4. Instalar pip y dependencias DENTRO del venv
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 WORKDIR /app
-
-COPY requirements.txt .
-
-# 4. Instalar dependencias usando pip de Python 3.12
-RUN python3.12 -m pip install --no-cache-dir -r requirements.txt
-
 COPY . .
 
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
 
-# 5. Ejecutar con Python 3.12
-CMD exec python3.12 -m gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 sistema_vigilancia.src.cloud_run_main:app
+# 5. Ejecutar (Al estar el PATH configurado, 'gunicorn' usa el del venv automáticamente)
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 sistema_vigilancia.src.cloud_run_main:app
