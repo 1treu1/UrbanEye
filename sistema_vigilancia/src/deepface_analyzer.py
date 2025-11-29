@@ -5,21 +5,22 @@ import cv2
 from deepface import DeepFace
 
 import sistema_vigilancia.src.config as config
+from .roi_manager import VideoState
 
 
-def should_run_deepface() -> bool:
+def should_run_deepface(state: VideoState) -> bool:
     """Check if DeepFace should run on this frame based on throttling."""
-    return (config.GLOBAL_FRAME_IDX - config.LAST_DEEPFACE_FRAME) >= config.DEEPFACE_FRAME_SKIP
+    return (state.global_frame_idx - state.last_deepface_frame) >= config.DEEPFACE_FRAME_SKIP
 
 
-def clean_old_cache() -> None:
+def clean_old_cache(state: VideoState) -> None:
     """Remove old entries from DeepFace cache."""
     tracks_to_remove = []
-    for cached_tid, cached_data in config.DEEPFACE_CACHE.items():
-        if cached_data.get("frame", 0) < config.GLOBAL_FRAME_IDX - config.DEEPFACE_CACHE_AGE:
+    for cached_tid, cached_data in state.deepface_cache.items():
+        if cached_data.get("frame", 0) < state.global_frame_idx - config.DEEPFACE_CACHE_AGE:
             tracks_to_remove.append(cached_tid)
     for tid in tracks_to_remove:
-        del config.DEEPFACE_CACHE[tid]
+        del state.deepface_cache[tid]
 
 
 def calculate_iou(bbox1: List[float], bbox2: List[float]) -> float:
@@ -152,7 +153,8 @@ def parse_deepface_region(region: Dict[str, Any], roi_offset: Tuple[int, int] = 
 def analyze_roi_with_deepface(
     roi_frame_rgb,
     yolo_tracks: Dict[int, Dict[str, Any]],
-    roi_coords: Tuple[int, int, int, int]
+    roi_coords: Tuple[int, int, int, int],
+    state: VideoState
 ) -> Tuple[Dict[int, Dict[str, Any]], List[Dict[str, Any]]]:
     """Analyze ROI region with DeepFace and match to YOLO tracks.
     
@@ -160,6 +162,7 @@ def analyze_roi_with_deepface(
         roi_frame_rgb: ROI region in RGB format
         yolo_tracks: Dictionary of YOLO tracks
         roi_coords: (rx0, ry0, rx1, ry1) ROI coordinates
+        state: VideoState instance
     
     Returns:
         Tuple of (deepface_results, deepface_full_roi_results)
@@ -170,8 +173,8 @@ def analyze_roi_with_deepface(
     deepface_full_roi_results: List[Dict[str, Any]] = []
     rx0, ry0, _, _ = roi_coords
     
-    config.LAST_DEEPFACE_FRAME = config.GLOBAL_FRAME_IDX
-    clean_old_cache()
+    state.last_deepface_frame = state.global_frame_idx
+    clean_old_cache(state)
     
     try:
         df_roi_results = DeepFace.analyze(
@@ -220,9 +223,9 @@ def analyze_roi_with_deepface(
                     }
                 
                 # Update cache
-                config.DEEPFACE_CACHE[best_track_id] = {
+                state.deepface_cache[best_track_id] = {
                     **deepface_results[best_track_id],
-                    "frame": config.GLOBAL_FRAME_IDX
+                    "frame": state.global_frame_idx
                 }
             else:
                 # No match: standalone detection
@@ -237,14 +240,15 @@ def analyze_roi_with_deepface(
 
 def populate_from_cache(
     yolo_tracks: Dict[int, Dict[str, Any]],
-    deepface_results: Dict[int, Dict[str, Any]]
+    deepface_results: Dict[int, Dict[str, Any]],
+    state: VideoState
 ) -> None:
     """Populate deepface_results from cache for tracks in ROI."""
     for track_id, yolo_track in yolo_tracks.items():
         if yolo_track["inside_roi"] and track_id not in deepface_results:
-            if track_id in config.DEEPFACE_CACHE:
-                cached = config.DEEPFACE_CACHE[track_id]
-                if cached.get("frame", 0) >= config.GLOBAL_FRAME_IDX - config.DEEPFACE_CACHE_AGE:
+            if track_id in state.deepface_cache:
+                cached = state.deepface_cache[track_id]
+                if cached.get("frame", 0) >= state.global_frame_idx - config.DEEPFACE_CACHE_AGE:
                     deepface_results[track_id] = {
                         "age": cached.get("age"),
                         "gender": cached.get("gender"),
@@ -256,7 +260,8 @@ def populate_from_cache(
 def match_standalone_detections(
     yolo_tracks: Dict[int, Dict[str, Any]],
     deepface_results: Dict[int, Dict[str, Any]],
-    deepface_full_roi_results: List[Dict[str, Any]]
+    deepface_full_roi_results: List[Dict[str, Any]],
+    state: VideoState
 ) -> None:
     """Match standalone DeepFace detections to YOLO tracks that don't have results."""
     for track_id, yolo_track in yolo_tracks.items():
@@ -284,8 +289,8 @@ def match_standalone_detections(
                     "race": best_match.get("race"),
                     "emotion": best_match.get("emotion"),
                 }
-                config.DEEPFACE_CACHE[track_id] = {
+                state.deepface_cache[track_id] = {
                     **deepface_results[track_id],
-                    "frame": config.GLOBAL_FRAME_IDX
+                    "frame": state.global_frame_idx
                 }
 

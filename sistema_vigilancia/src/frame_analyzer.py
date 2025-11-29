@@ -16,7 +16,7 @@ from .visualization import (
     draw_trails, draw_yolo_tracks, draw_deepface_detections,
     draw_status, draw_roi
 )
-from .roi_manager import write_track_to_csv, flush_window
+from .roi_manager import write_track_to_csv, flush_window, VideoState
 
 
 def calculate_roi_coords(frame_shape: Tuple[int, int, int], roi_size: float) -> Tuple[int, int, int, int]:
@@ -41,13 +41,15 @@ def calculate_roi_coords(frame_shape: Tuple[int, int, int], roi_size: float) -> 
 
 def update_tracks_and_trails(
     yolo_tracks: Dict[int, Dict[str, Any]],
-    deepface_results: Dict[int, Dict[str, Any]]
+    deepface_results: Dict[int, Dict[str, Any]],
+    state: VideoState
 ) -> set:
     """Update global tracks and trails from YOLO tracks.
     
     Args:
         yolo_tracks: Dictionary of YOLO tracks
         deepface_results: Dictionary of DeepFace results
+        state: VideoState instance
     
     Returns:
         Set of current track IDs
@@ -58,8 +60,8 @@ def update_tracks_and_trails(
         current_track_ids.add(track_id)
         
         # Update or create track
-        if track_id not in config.TRACKS:
-            config.TRACKS[track_id] = {
+        if track_id not in state.tracks:
+            state.tracks[track_id] = {
                 "bbox": yolo_track["bbox"],
                 "ages": [],
                 "genders": [],
@@ -68,15 +70,15 @@ def update_tracks_and_trails(
                 "inside": False,
                 "frames_in": 0,
             }
-            config.TRAILS[track_id] = deque(maxlen=config.MAX_TRAIL_LENGTH)
+            state.trails[track_id] = deque(maxlen=config.MAX_TRAIL_LENGTH)
         
-        track = config.TRACKS[track_id]
+        track = state.tracks[track_id]
         track["bbox"] = yolo_track["bbox"]
-        track["last_seen"] = config.GLOBAL_FRAME_IDX
+        track["last_seen"] = state.global_frame_idx
         
         # Update trail with center position
         cx, cy = yolo_track["center"]
-        config.TRAILS[track_id].append((cx, cy))
+        state.trails[track_id].append((cx, cy))
         
         # Process ROI tracking
         inside_roi = yolo_track["inside_roi"]
@@ -88,7 +90,7 @@ def update_tracks_and_trails(
         if inside_roi:
             if not was_inside:
                 # Just entered ROI
-                track["enter_time"] = config.GLOBAL_FRAME_IDX / config.FPS_ASSUMED / 60.0
+                track["enter_time"] = state.global_frame_idx / state.fps_assumed / 60.0
                 track["frames_in"] = 0
                 track["inside"] = True
                 track["ages"] = []
@@ -127,9 +129,9 @@ def update_tracks_and_trails(
         else:
             if was_inside:
                 # Just exited ROI
-                track["exit_time"] = config.GLOBAL_FRAME_IDX / config.FPS_ASSUMED / 60.0
+                track["exit_time"] = state.global_frame_idx / state.fps_assumed / 60.0
                 track["inside"] = False
-                write_track_to_csv(track_id, track)
+                write_track_to_csv(track_id, track, state)
                 # Clear for potential re-entry
                 if "enter_time" in track:
                     del track["enter_time"]
@@ -144,22 +146,23 @@ def update_tracks_and_trails(
     return current_track_ids
 
 
-def cleanup_old_tracks(current_track_ids: set) -> None:
+def cleanup_old_tracks(current_track_ids: set, state: VideoState) -> None:
     """Remove tracks that are no longer active.
     
     Args:
         current_track_ids: Set of currently active track IDs
+        state: VideoState instance
     """
     tracks_to_remove = []
     
-    for track_id in list(config.TRACKS.keys()):
+    for track_id in list(state.tracks.keys()):
         if track_id not in current_track_ids:
             # Track disappeared - if inside ROI, flush it
-            if config.TRACKS[track_id].get("inside", False):
-                track = config.TRACKS[track_id]
-                track["exit_time"] = config.GLOBAL_FRAME_IDX / config.FPS_ASSUMED / 60.0
+            if state.tracks[track_id].get("inside", False):
+                track = state.tracks[track_id]
+                track["exit_time"] = state.global_frame_idx / state.fps_assumed / 60.0
                 track["inside"] = False
-                write_track_to_csv(track_id, track)
+                write_track_to_csv(track_id, track, state)
                 # Clear for potential re-entry
                 if "enter_time" in track:
                     del track["enter_time"]
@@ -168,30 +171,34 @@ def cleanup_old_tracks(current_track_ids: set) -> None:
             tracks_to_remove.append(track_id)
     
     for track_id in tracks_to_remove:
-        if track_id in config.TRACKS:
-            del config.TRACKS[track_id]
-        if track_id in config.TRAILS:
-            del config.TRAILS[track_id]
+        if track_id in state.tracks:
+            del state.tracks[track_id]
+        if track_id in state.trails:
+            del state.trails[track_id]
 
 
 def analyze_frame(
     frame_bgr: np.ndarray,
+    state: VideoState,
     roi_size: float = 0.65,
     yolo_conf: float = 0.15,
-    yolo_iou: float = 0.45
+    yolo_iou: float = 0.45,
+    visualize: bool = True
 ) -> np.ndarray:
     """Analyze a single frame: detect, track, and analyze persons.
     
     Args:
         frame_bgr: Frame in BGR format
+        state: VideoState instance
         roi_size: ROI size as fraction (0.0-1.0)
         yolo_conf: YOLO confidence threshold
         yolo_iou: YOLO IoU threshold
+        visualize: Whether to draw visualizations on the frame
     
     Returns:
         Annotated frame with detections and labels
     """
-    # Note: GLOBAL_FRAME_IDX is incremented in stream_generator, not here
+    # Note: state.global_frame_idx is incremented in stream_generator, not here
     
     # Initialize models
     init_yolo_model()
@@ -219,35 +226,41 @@ def analyze_frame(
     deepface_results: Dict[int, Dict[str, Any]] = {}
     deepface_full_roi_results: List[Dict[str, Any]] = []
     
-    if should_run_deepface():
+    if should_run_deepface(state):
         # Lazy RGB conversion
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         roi_frame_rgb = frame_rgb[ry0:ry1, rx0:rx1] if (ry1 > ry0 and rx1 > rx0) else frame_rgb
         
         deepface_results, deepface_full_roi_results = analyze_roi_with_deepface(
-            roi_frame_rgb, yolo_tracks, roi_coords
+            roi_frame_rgb, yolo_tracks, roi_coords, state
         )
     else:
         # Use cache
-        populate_from_cache(yolo_tracks, deepface_results)
+        populate_from_cache(yolo_tracks, deepface_results, state)
     
     # Fallback matching
-    match_standalone_detections(yolo_tracks, deepface_results, deepface_full_roi_results)
+    match_standalone_detections(yolo_tracks, deepface_results, deepface_full_roi_results, state)
     
     # Step 3: Update tracks and process ROI
-    current_track_ids = update_tracks_and_trails(yolo_tracks, deepface_results)
-    cleanup_old_tracks(current_track_ids)
+    current_track_ids = update_tracks_and_trails(yolo_tracks, deepface_results, state)
+    cleanup_old_tracks(current_track_ids, state)
     
     # Step 4: Visualization
-    draw_trails(annotated, yolo_tracks)
-    num_tracks = draw_yolo_tracks(annotated, yolo_tracks, deepface_results)
-    num_deepface = draw_deepface_detections(annotated, deepface_full_roi_results)
-    draw_status(annotated, num_tracks, num_deepface)
-    draw_roi(annotated, roi_coords)
+    if visualize:
+        draw_trails(annotated, state.trails)
+        # Draw YOLO tracks (includes DeepFace info)
+        num_tracks = draw_yolo_tracks(annotated, yolo_tracks, deepface_results, state)
+        # Draw standalone DeepFace detections
+        num_deepface = draw_deepface_detections(annotated, deepface_full_roi_results)
+        # Draw status info
+        draw_status(annotated, num_tracks, num_deepface)
+        # Draw ROI
+        if state.roi_mode != "none":
+            draw_roi(annotated, roi_coords)
     
     # Window flush
-    if config.ROI_MODE != "none" and config.WINDOW_FRAMES > 0 and config.GLOBAL_FRAME_IDX >= config.WINDOW_FRAMES:
-        flush_window()
+    if state.roi_mode != "none" and state.window_frames > 0 and state.global_frame_idx >= state.window_frames:
+        flush_window(state)
     
     return annotated
 

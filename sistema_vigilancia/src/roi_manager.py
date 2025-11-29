@@ -2,67 +2,73 @@
 
 import os
 import csv
+import threading
 from datetime import date
-from typing import Dict, Any
+from typing import Dict, Any, Deque
+from collections import deque
 
 import sistema_vigilancia.src.config as config
 
-
-def set_roi_config(
-    roi_mode: str, 
-    csv_path: str, 
-    duration_min: int, 
-    fps: int,
-    latitud: str = "",
-    longitud: str = "",
-    lugar: str = ""
-) -> None:
-    """Configure ROI tracking settings.
-    
-    Args:
-        roi_mode: Tracking mode ("none", "consolidated", "visits")
-        csv_path: Path to CSV file for exporting data
-        duration_min: Window duration in minutes
-        fps: Assumed frames per second
-        latitud: Location latitude
-        longitud: Location longitude
-        lugar: Location name
-    """
-    config.ROI_MODE = roi_mode
-    config.CSV_PATH = csv_path
-    config.FPS_ASSUMED = fps
-    config.WINDOW_FRAMES = max(1, duration_min * 60 * fps)
-    config.GLOBAL_FRAME_IDX = 0
-    
-    # Update location config
-    if latitud: config.LATITUD = latitud
-    if longitud: config.LONGITUD = longitud
-    if lugar: config.LUGAR = lugar
-    
-    # Reset DeepFace state
-    config.LAST_DEEPFACE_FRAME = -config.DEEPFACE_FRAME_SKIP
-    config.DEEPFACE_CACHE.clear()
-    
-    # Reset tracker
-    config.NEXT_TRACK_ID = 1
-    config.TRACKS.clear()
-    
-    # Write header if file doesn't exist
-    if config.ROI_MODE != "none" and config.CSV_PATH:
-        if not os.path.exists(config.CSV_PATH) or os.path.getsize(config.CSV_PATH) == 0:
-            with open(config.CSV_PATH, "w", encoding="utf-8", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["time_input", "time_out", "track_id", "age", "gender", "race", "emotion", "time_2", "date", "latitud", "longitud", "lugar"])
+# Global lock for CSV writing
+CSV_LOCK = threading.Lock()
 
 
-def write_track_to_csv(tid: int, track: Dict[str, Any]) -> None:
+class VideoState:
+    """Encapsulates the state for a single video processing session."""
+    
+    def __init__(
+        self,
+        roi_mode: str,
+        csv_path: str,
+        duration_min: int,
+        fps: float,
+        latitud: str = "",
+        longitud: str = "",
+        lugar: str = ""
+    ):
+        self.roi_mode = roi_mode
+        self.csv_path = csv_path
+        self.fps_assumed = fps
+        self.window_frames = max(1, duration_min * 60 * fps)
+        self.global_frame_idx = 0
+        
+        self.latitud = latitud
+        self.longitud = longitud
+        self.lugar = lugar
+        
+        # DeepFace state
+        self.last_deepface_frame = -config.DEEPFACE_FRAME_SKIP
+        self.deepface_cache: Dict[int, Dict[str, Any]] = {}
+        
+        # Tracker state
+        self.next_track_id = 1
+        self.tracks: Dict[int, Dict[str, Any]] = {}
+        self.trails: Dict[int, Deque] = {}
+        
+        # Initialize CSV
+        self._init_csv()
+
+    def _init_csv(self):
+        if self.roi_mode != "none" and self.csv_path:
+            with CSV_LOCK:
+                if not os.path.exists(self.csv_path) or os.path.getsize(self.csv_path) == 0:
+                    try:
+                        with open(self.csv_path, "w", encoding="utf-8", newline="") as f:
+                            writer = csv.writer(f)
+                            writer.writerow(["time_input", "time_out", "track_id", "age", "gender", "race", "emotion", "time_2", "date", "latitud", "longitud", "lugar"])
+                    except Exception as e:
+                        print(f"Error initializing CSV: {e}")
+
+
+def write_track_to_csv(tid: int, track: Dict[str, Any], state: VideoState) -> None:
     """Write a completed track to CSV.
     
     Args:
         tid: Track ID
         track: Track data dictionary
+        state: VideoState instance
     """
-    if not config.CSV_PATH or config.ROI_MODE == "none":
+    if not state.csv_path or state.roi_mode == "none":
         return
     
     if "enter_time" not in track or "exit_time" not in track:
@@ -102,47 +108,51 @@ def write_track_to_csv(tid: int, track: Dict[str, Any]) -> None:
         emotions_str = ""
     
     # Write to CSV
-    file_exists = os.path.exists(config.CSV_PATH) and os.path.getsize(config.CSV_PATH) > 0
-    
-    with open(config.CSV_PATH, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["time_input", "time_out", "track_id", "age", "gender", "race", "emotion", "time_2", "date", "latitud", "longitud", "lugar"])
-        
-        current_date = date.today().isoformat()
-        
-        writer.writerow([
-            f"{time_input:.6f}",
-            f"{time_out:.6f}",
-            tid,
-            f"{avg_age:.1f}",
-            genders_str,
-            races_str,
-            emotions_str,
-            f"{time_2:.6f}",
-            current_date,
-            config.LATITUD or "",
-            config.LONGITUD or "",
-            config.LUGAR or ""
-        ])
+    try:
+        with CSV_LOCK:
+            file_exists = os.path.exists(state.csv_path) and os.path.getsize(state.csv_path) > 0
+            
+            with open(state.csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(["time_input", "time_out", "track_id", "age", "gender", "race", "emotion", "time_2", "date", "latitud", "longitud", "lugar"])
+                
+                current_date = date.today().isoformat()
+                
+                writer.writerow([
+                    f"{time_input:.6f}",
+                    f"{time_out:.6f}",
+                    tid,
+                    f"{avg_age:.1f}",
+                    genders_str,
+                    races_str,
+                    emotions_str,
+                    f"{time_2:.6f}",
+                    current_date,
+                    state.latitud or "",
+                    state.longitud or "",
+                    state.lugar or ""
+                ])
+    except Exception as e:
+        print(f"Error writing to CSV: {e}")
 
 
-def flush_window() -> None:
+def flush_window(state: VideoState) -> None:
     """Flush tracks that are still in ROI after window expires or video ends."""
     tracks_to_flush = []
     
-    for tid, track in list(config.TRACKS.items()):
+    for tid, track in list(state.tracks.items()):
         # Check if track has entered ROI but hasn't exited yet
         if "enter_time" in track and track.get("inside", False):
-            track["exit_time"] = config.GLOBAL_FRAME_IDX / config.FPS_ASSUMED / 60.0  # minutes
+            track["exit_time"] = state.global_frame_idx / state.fps_assumed / 60.0  # minutes
             track["inside"] = False
             tracks_to_flush.append((tid, track.copy()))
         # Also check inactive tracks that might have entered but weren't detected exiting
         elif "enter_time" in track and "exit_time" not in track:
-            track["exit_time"] = config.GLOBAL_FRAME_IDX / config.FPS_ASSUMED / 60.0
+            track["exit_time"] = state.global_frame_idx / state.fps_assumed / 60.0
             track["inside"] = False
             tracks_to_flush.append((tid, track.copy()))
     
     for tid, track in tracks_to_flush:
-        write_track_to_csv(tid, track)
+        write_track_to_csv(tid, track, state)
 

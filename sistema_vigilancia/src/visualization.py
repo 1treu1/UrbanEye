@@ -1,23 +1,21 @@
 """Visualization and drawing utilities."""
 
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Deque
 import cv2
 import numpy as np
 
 import sistema_vigilancia.src.config as config
+from .roi_manager import VideoState
 
 
-def draw_trails(annotated: np.ndarray, yolo_tracks: Dict[int, Dict[str, Any]]) -> None:
+def draw_trails(annotated: np.ndarray, trails: Dict[int, Deque]) -> None:
     """Draw trails for tracked objects.
     
     Args:
         annotated: Frame to draw on
-        yolo_tracks: Dictionary of YOLO tracks
+        trails: Dictionary of trails (deque of points)
     """
-    for track_id, trail in config.TRAILS.items():
-        if track_id not in yolo_tracks:
-            continue
-        
+    for track_id, trail in trails.items():
         # Draw trail as connected lines
         if len(trail) > 1:
             points = list(trail)
@@ -33,7 +31,8 @@ def draw_trails(annotated: np.ndarray, yolo_tracks: Dict[int, Dict[str, Any]]) -
 def draw_yolo_tracks(
     annotated: np.ndarray,
     yolo_tracks: Dict[int, Dict[str, Any]],
-    deepface_results: Dict[int, Dict[str, Any]]
+    deepface_results: Dict[int, Dict[str, Any]],
+    state: VideoState
 ) -> int:
     """Draw YOLO tracks with DeepFace attributes.
     
@@ -41,6 +40,7 @@ def draw_yolo_tracks(
         annotated: Frame to draw on
         yolo_tracks: Dictionary of YOLO tracks
         deepface_results: Dictionary of DeepFace results per track_id
+        state: VideoState instance
     
     Returns:
         Number of tracks drawn
@@ -66,9 +66,9 @@ def draw_yolo_tracks(
             emotion = df_attrs.get("emotion")
             
             elapsed_txt = ""
-            if track_id in config.TRACKS and "enter_time" in config.TRACKS[track_id]:
-                enter_time_min = config.TRACKS[track_id]["enter_time"]
-                current_time_min = config.GLOBAL_FRAME_IDX / max(1, config.FPS_ASSUMED) / 60.0
+            if track_id in state.tracks and "enter_time" in state.tracks[track_id]:
+                enter_time_min = state.tracks[track_id]["enter_time"]
+                current_time_min = state.global_frame_idx / max(1, state.fps_assumed) / 60.0
                 elapsed_sec = (current_time_min - enter_time_min) * 60.0
                 elapsed_txt = f" • {elapsed_sec:.1f}s"
             

@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Generator, Optional, Tuple
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, Future
+from typing import Generator, Optional, Tuple, List
 import cv2
 import gradio as gr
 import numpy as np
 
 from .frame_analyzer import analyze_frame
-from .roi_manager import set_roi_config, flush_window, write_track_to_csv
+from .roi_manager import flush_window, write_track_to_csv, VideoState
 import sistema_vigilancia.src.config as config
 from .domain.utils import gcs_utils
-
 
 
 def get_video_fps(video_path: str) -> float:
@@ -28,24 +29,100 @@ def get_video_fps(video_path: str) -> float:
     except Exception:
         return 22.0
 
+
+def process_video_headless(
+    video_blob: str,
+    roi_mode: str,
+    csv_path: str,
+    duration_min: int,
+    roi_size: float,
+    lat: str,
+    lon: str,
+    place: str
+) -> str:
+    """Process a video in background without UI updates."""
+    temp_path = ""
+    try:
+        # Create unique temp file
+        fd, temp_path = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd)
+        
+        print(f"Background processing: Downloading {video_blob}...")
+        gcs_utils.download_blob("bk-urbaneye-videos", video_blob, temp_path)
+        
+        real_fps = get_video_fps(temp_path)
+        print(f"Background processing: {video_blob} (FPS: {real_fps})")
+        
+        state = VideoState(roi_mode, csv_path, duration_min, real_fps, lat, lon, place)
+        
+        cap = cv2.VideoCapture(temp_path)
+        if not cap.isOpened():
+            return f"Error opening {video_blob}"
+            
+        frame_idx = 0
+        analyze_every_n = 10
+        max_width = 640
+        
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                if state.roi_mode != "none":
+                    flush_window(state)
+                break
+            
+            h, w = frame.shape[:2]
+            if w > max_width:
+                scale = max_width / float(w)
+                frame_small = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+            else:
+                frame_small = frame
+            
+            state.global_frame_idx += 1
+            
+            if frame_idx % analyze_every_n == 0:
+                analyze_frame(frame_small, state, roi_size=roi_size)
+            
+            frame_idx += 1
+            
+            # Heartbeat for logs
+            if frame_idx % 500 == 0:
+                print(f"Background {video_blob}: Frame {frame_idx}")
+                
+        cap.release()
+        return f"Completed {video_blob}"
+        
+    except Exception as e:
+        print(f"Error in background processing {video_blob}: {e}")
+        return f"Error {video_blob}: {e}"
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+
+
 def stream_generator(
     video_path: str,
+    roi_mode: str,
+    csv_path: str,
+    duration_min: int,
+    lat: str,
+    lon: str,
+    place: str,
     analyze_every_n: int = 10,
     max_width: int = 640,
     roi_size: float = 0.65,
-    yield_every_n: int = 3
+    yield_every_n: int = 3,
+    visualize: bool = True
 ) -> Generator[np.ndarray, None, None]:
-    """Generate annotated video frames for Gradio streaming.
+    """Generate annotated video frames for Gradio streaming."""
     
-    Args:
-        video_path: Path to video file
-        analyze_every_n: Analyze every N frames (reuse last annotation otherwise)
-        max_width: Maximum frame width for processing
-        roi_size: ROI size as fraction (0.0-1.0)
+    # Initialize state for this video
+    real_fps = get_video_fps(video_path)
+    state = VideoState(roi_mode, csv_path, duration_min, real_fps, lat, lon, place)
+    print(f"Streaming video: {video_path} (FPS: {real_fps})")
     
-    Yields:
-        Annotated frames in RGB format
-    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"No se pudo abrir el video: {video_path}")
@@ -59,17 +136,14 @@ def stream_generator(
         
         frame_idx = 0
         last_annotated: Optional[np.ndarray] = None
-        last_yield_time = 0.0
         
         while True:
             ok, frame = cap.read()
             if not ok:
-                # Video ended - flush any remaining tracks in ROI
-                if config.ROI_MODE != "none":
-                    flush_window()
+                if state.roi_mode != "none":
+                    flush_window(state)
                 break
             
-            # Resize for speed, preserve aspect ratio
             h, w = frame.shape[:2]
             if w > max_width:
                 scale = max_width / float(w)
@@ -77,12 +151,11 @@ def stream_generator(
             else:
                 frame_small = frame
             
-            # Increment global frame counter for each frame (for accurate time tracking)
-            config.GLOBAL_FRAME_IDX += 1
+            state.global_frame_idx += 1
             
             # Analyze every N frames; reuse last annotation otherwise for smoothness
             if frame_idx % analyze_every_n == 0 or last_annotated is None:
-                annotated_small = analyze_frame(frame_small, roi_size=roi_size)
+                annotated_small = analyze_frame(frame_small, state, roi_size=roi_size, visualize=visualize)
                 # If we downscaled, upscale annotations back to original size for display stability
                 if annotated_small.shape[1] != w:
                     annotated = cv2.resize(annotated_small, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -96,7 +169,7 @@ def stream_generator(
             
             # Heartbeat log
             if frame_idx % 30 == 0:
-                print(f"Processing frame {frame_idx}...")
+                print(f"Streaming frame {frame_idx}...")
             
             # Yield first frame and then every N frames
             if frame_idx == 1 or frame_idx % yield_every_n == 0:
@@ -104,15 +177,6 @@ def stream_generator(
                 yield annotated_rgb
     
     finally:
-        # Final flush of any remaining tracks in ROI when stream ends
-        if config.ROI_MODE != "none":
-            flush_window()
-            # Additional check: flush any tracks with enter_time but no exit_time
-            for tid, track in list(config.TRACKS.items()):
-                if "enter_time" in track and "exit_time" not in track:
-                    track["exit_time"] = config.GLOBAL_FRAME_IDX / config.FPS_ASSUMED / 60.0
-                    track["inside"] = False
-                    write_track_to_csv(tid, track)
         cap.release()
 
 
@@ -123,24 +187,11 @@ def build_demo(
     duration_min: int = 30,
     fps: int = 22
 ) -> gr.Blocks:
-    """Build Gradio demo interface.
-    
-    Args:
-        default_video: Default video path
-        roi_mode: ROI tracking mode
-        csv_path: Path to CSV output file
-        duration_min: Window duration in minutes
-        fps: Assumed frames per second
-    
-    Returns:
-        Gradio Blocks interface
-    """
+    """Build Gradio demo interface."""
     # Set ROI configuration - auto-configure CSV path if not provided
     if not csv_path:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         csv_path = os.path.join(base_dir, "roi_stats.csv")
-    set_roi_config(roi_mode=roi_mode, csv_path=csv_path, duration_min=duration_min, fps=fps)
-    
     
     # Get GCS folders (if credentials available)
     gcs_folders = []
@@ -150,7 +201,7 @@ def build_demo(
         print(f"Warning: Could not list GCS folders: {e}")
 
     with gr.Blocks() as demo:
-        gr.Markdown("## Sistema de Vigilancia - DeepFace Stream (video)")
+        gr.Markdown("## Sistema de Vigilancia - DeepFace Stream (Procesamiento Paralelo)")
         
         with gr.Row():
             source_mode = gr.Dropdown(
@@ -172,6 +223,10 @@ def build_demo(
             lat_input = gr.Textbox(value=config.LATITUD, label="Latitud", interactive=True)
             lon_input = gr.Textbox(value=config.LONGITUD, label="Longitud", interactive=True)
             lugar_input = gr.Textbox(value=config.LUGAR, label="Lugar", interactive=True)
+
+        with gr.Row():
+            show_visuals = gr.Checkbox(value=True, label="Mostrar Visualizaciones (Bounding Boxes/ROI)", interactive=True)
+            num_workers = gr.Slider(minimum=1, maximum=10, value=2, step=1, label="Workers Paralelos (GCS)", interactive=True)
 
         roi_size_slider = gr.Slider(
             minimum=0.1,
@@ -201,30 +256,19 @@ def build_demo(
                 
         refresh_btn.click(fn=refresh_gcs, inputs=[], outputs=folder_dd)
         
-        def start(mode: str, vpath: str, folder: str, roi_size: float, lat: str, lon: str, place: str) -> Generator[Tuple[np.ndarray, str], None, None]:
+        def start(mode: str, vpath: str, folder: str, roi_size: float, lat: str, lon: str, place: str, visualize: bool, max_workers: int) -> Generator[Tuple[np.ndarray, str], None, None]:
             
             if mode == "Local File":
-                # Detect FPS for local video
-                real_fps = get_video_fps(vpath)
-                print(f"Detected FPS for {vpath}: {real_fps}")
-                
-                # Reset ROI config
-                set_roi_config(
-                    roi_mode=roi_mode, 
-                    csv_path=csv_path, 
-                    duration_min=duration_min, 
-                    fps=real_fps,
-                    latitud=lat,
-                    longitud=lon,
-                    lugar=place
-                )
-                
                 # Generator wrapper to yield (image, progress)
-                gen = stream_generator(vpath, analyze_every_n=10, max_width=640, roi_size=roi_size, yield_every_n=3)
+                gen = stream_generator(
+                    vpath, roi_mode, csv_path, duration_min, lat, lon, place,
+                    analyze_every_n=10, max_width=640, roi_size=roi_size, yield_every_n=3,
+                    visualize=visualize
+                )
                 for frame in gen:
                     yield frame, "Procesando video local..."
             else:
-                # GCS Batch Mode
+                # GCS Batch Mode with Parallel Processing
                 if not folder:
                     yield np.zeros((100, 100, 3), dtype=np.uint8), "Error: Seleccione una carpeta"
                     return
@@ -232,57 +276,121 @@ def build_demo(
                     videos = gcs_utils.list_videos_in_folder("bk-urbaneye-videos", folder)
                     total_videos = len(videos)
                     
-                    for i, video_blob in enumerate(videos):
-                        video_name = os.path.basename(video_blob)
-                        progress_msg = f"Procesando video {i+1} de {total_videos}: {video_name}"
+                    if total_videos == 0:
+                        yield np.zeros((100, 100, 3), dtype=np.uint8), "No se encontraron videos en la carpeta"
+                        return
+
+                    # We will process N videos in parallel: 1 in main thread (streaming), N-1 in background
+                    # Ensure at least 1 worker
+                    max_workers = int(max(1, max_workers))
+                    
+                    executor = ThreadPoolExecutor(max_workers=max_workers)
+                    futures = []
+                    
+                    # Queue of videos to process
+                    video_queue = list(videos)
+                    completed_count = 0
+                    
+                    while video_queue or futures:
+                        # Fill background workers
+                        # We keep 1 slot "virtual" for the main thread streaming, so we submit max_workers - 1 to background
+                        # But wait, ThreadPoolExecutor manages threads. If we submit max_workers tasks, they will all run.
+                        # The main thread is separate. So if we want TOTAL parallelism of max_workers + 1 (main), we can submit max_workers.
+                        # If user sets "Workers" to 4, they probably expect 4 total.
+                        # Let's say max_workers is the BACKGROUND workers count.
+                        # Or better: max_workers is total concurrent videos.
+                        # If max_workers = 1, then only main thread runs (sequential).
+                        # If max_workers = 2, 1 main + 1 background.
                         
-                        # Yield loading state
-                        yield np.zeros((100, 100, 3), dtype=np.uint8), f"Descargando {video_name}..."
+                        bg_workers = max(0, max_workers - 1)
                         
-                        # Download to temp file
-                        temp_path = os.path.join(os.getcwd(), "temp_video.mp4")
-                        gcs_utils.download_blob("bk-urbaneye-videos", video_blob, temp_path)
-                        
-                        try:
-                            # Detect FPS for downloaded video
-                            real_fps = get_video_fps(temp_path)
-                            print(f"Detected FPS for {video_blob}: {real_fps}")
+                        while len(futures) < bg_workers and len(video_queue) > 1:
+                            # Pop from end or start? Let's pop from start, but reserve index 0 for UI if not running
+                            # Actually, let's just pop the next available video for background
+                            # Strategy: Always keep 1 video for the UI thread to pick up
                             
-                            # Reset/Update ROI config for this video
-                            set_roi_config(
-                                roi_mode=roi_mode, 
-                                csv_path=csv_path, 
-                                duration_min=duration_min, 
-                                fps=real_fps,
-                                latitud=lat,
-                                longitud=lon,
-                                lugar=place
+                            # If we have at least 2 videos, send one to background
+                            bg_video = video_queue.pop(0)
+                            print(f"Submitting background task: {bg_video}")
+                            f = executor.submit(
+                                process_video_headless, 
+                                bg_video, roi_mode, csv_path, duration_min, roi_size, lat, lon, place
                             )
+                            futures.append(f)
                             
-                            gen = stream_generator(temp_path, analyze_every_n=10, max_width=640, roi_size=roi_size, yield_every_n=3)
-                            for frame in gen:
-                                yield frame, progress_msg
+                            # If we only have 1 left, break so UI can take it
+                            if len(video_queue) == 0:
+                                break
                                 
-                        finally:
-                            if os.path.exists(temp_path):
-                                os.remove(temp_path)
+                        # Clean up finished futures
+                        done_futures = [f for f in futures if f.done()]
+                        for f in done_futures:
+                            futures.remove(f)
+                            completed_count += 1
+                            try:
+                                res = f.result()
+                                print(f"Background task result: {res}")
+                            except Exception as e:
+                                print(f"Background task failed: {e}")
+                        
+                        # If we have a video for the UI, process it
+                        if video_queue:
+                            ui_video_blob = video_queue.pop(0)
+                            video_name = os.path.basename(ui_video_blob)
+                            
+                            yield np.zeros((100, 100, 3), dtype=np.uint8), f"Descargando {video_name} (Lote: {completed_count}/{total_videos})..."
+                            
+                            # Download to temp file
+                            fd, temp_path = tempfile.mkstemp(suffix=".mp4")
+                            os.close(fd)
+                            gcs_utils.download_blob("bk-urbaneye-videos", ui_video_blob, temp_path)
+                            
+                            try:
+                                gen = stream_generator(
+                                    temp_path, roi_mode, csv_path, duration_min, lat, lon, place,
+                                    analyze_every_n=10, max_width=640, roi_size=roi_size, yield_every_n=3,
+                                    visualize=visualize
+                                )
+                                for frame in gen:
+                                    # Check background futures occasionally?
+                                    # We can't easily check futures inside this loop without blocking or complex logic
+                                    # Just yield frames
+                                    yield frame, f"Procesando {video_name} (Lote: {completed_count}/{total_videos} completados + {len(futures)} en segundo plano)"
+                                
+                                completed_count += 1
+                            finally:
+                                if os.path.exists(temp_path):
+                                    os.remove(temp_path)
+                        else:
+                            # No videos for UI, but background tasks might be running
+                            if futures:
+                                yield np.zeros((100, 100, 3), dtype=np.uint8), f"Esperando tareas de fondo ({len(futures)} activas)..."
+                                time.sleep(1)
+                            else:
+                                break
+                                
+                    executor.shutdown(wait=True)
+                    yield np.zeros((100, 100, 3), dtype=np.uint8), f"Procesamiento completado: {total_videos} videos."
+
                 except Exception as e:
                     print(f"Error processing GCS folder: {e}")
                     yield np.zeros((100, 100, 3), dtype=np.uint8), f"Error: {e}"
         
         start_btn.click(
             fn=start, 
-            inputs=[source_mode, path_in, folder_dd, roi_size_slider, lat_input, lon_input, lugar_input], 
+            inputs=[source_mode, path_in, folder_dd, roi_size_slider, lat_input, lon_input, lugar_input, show_visuals, num_workers], 
             outputs=[output, progress_output]
         )
     
     # Warm-up: run a quick analyze on first frame to load models
     print("Inicializando modelos de IA (DeepFace + YOLO)... Por favor espere.")
     try:
+        # Create dummy state for warm-up
+        dummy_state = VideoState("none", "", 30, 22.0)
         cap = cv2.VideoCapture(default_video)
         ok, frame = cap.read()
         if ok:
-            _ = analyze_frame(frame)
+            _ = analyze_frame(frame, dummy_state)
         cap.release()
     except Exception:
         pass
