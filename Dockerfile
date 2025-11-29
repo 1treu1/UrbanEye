@@ -1,9 +1,14 @@
 FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
 
-# 1. Instalar dependencias del sistema, PPA y Python 3.12
-# Nota: Se agregó 'curl' para instalar pip manualmente después
+# 1. EVITAR PREGUNTAS (Solución al bloqueo)
+ARG DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
+# 2. Instalar dependencias, PPA, curl y Python 3.12
+# Se añade 'curl' y se elimina 'python3.12-distutils'
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+    tzdata \
     build-essential \
     software-properties-common \
     curl \
@@ -17,15 +22,14 @@ RUN apt-get update && \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Instalar PIP para Python 3.12 manualmente
-# (Esto es necesario porque el paquete python3-pip de Ubuntu suele ser para Python 3.10)
+# 3. Instalar PIP para Python 3.12 manualmente
 RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
 
 WORKDIR /app
 
 COPY requirements.txt .
 
-# 3. Instalar dependencias usando pip de Python 3.12
+# 4. Instalar dependencias usando pip de Python 3.12
 RUN python3.12 -m pip install --no-cache-dir -r requirements.txt
 
 COPY . .
@@ -33,5 +37,5 @@ COPY . .
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
 
-# 4. Ejecutar con Python 3.12
+# 5. Ejecutar con Python 3.12
 CMD exec python3.12 -m gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 sistema_vigilancia.src.cloud_run_main:app
