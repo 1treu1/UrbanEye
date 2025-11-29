@@ -67,8 +67,10 @@ def draw_yolo_tracks(
             
             elapsed_txt = ""
             if track_id in config.TRACKS and "enter_time" in config.TRACKS[track_id]:
-                frames_in = config.TRACKS[track_id].get("frames_in", 0)
-                elapsed_txt = f" • {frames_in / max(1, config.FPS_ASSUMED):.1f}s"
+                enter_time_min = config.TRACKS[track_id]["enter_time"]
+                current_time_min = config.GLOBAL_FRAME_IDX / max(1, config.FPS_ASSUMED) / 60.0
+                elapsed_sec = (current_time_min - enter_time_min) * 60.0
+                elapsed_txt = f" • {elapsed_sec:.1f}s"
             
             label = f"age: {age}  gender: {gender}  race: {race}  emotion: {emotion}{elapsed_txt}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from typing import Generator, Optional
+import time
+from typing import Generator, Optional, Tuple
 import cv2
 import gradio as gr
 import numpy as np
@@ -11,13 +12,28 @@ import numpy as np
 from .frame_analyzer import analyze_frame
 from .roi_manager import set_roi_config, flush_window, write_track_to_csv
 import sistema_vigilancia.src.config as config
+from .domain.utils import gcs_utils
 
+
+
+def get_video_fps(video_path: str) -> float:
+    """Detect FPS from video file."""
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return 22.0  # Default fallback
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap.release()
+        return fps if fps > 0 else 22.0
+    except Exception:
+        return 22.0
 
 def stream_generator(
     video_path: str,
     analyze_every_n: int = 10,
     max_width: int = 640,
-    roi_size: float = 0.65
+    roi_size: float = 0.65,
+    yield_every_n: int = 3
 ) -> Generator[np.ndarray, None, None]:
     """Generate annotated video frames for Gradio streaming.
     
@@ -43,6 +59,7 @@ def stream_generator(
         
         frame_idx = 0
         last_annotated: Optional[np.ndarray] = None
+        last_yield_time = 0.0
         
         while True:
             ok, frame = cap.read()
@@ -76,8 +93,15 @@ def stream_generator(
                 annotated = last_annotated
             
             frame_idx += 1
-            annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-            yield annotated_rgb
+            
+            # Heartbeat log
+            if frame_idx % 30 == 0:
+                print(f"Processing frame {frame_idx}...")
+            
+            # Yield first frame and then every N frames
+            if frame_idx == 1 or frame_idx % yield_every_n == 0:
+                annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                yield annotated_rgb
     
     finally:
         # Final flush of any remaining tracks in ROI when stream ends
@@ -117,9 +141,38 @@ def build_demo(
         csv_path = os.path.join(base_dir, "roi_stats.csv")
     set_roi_config(roi_mode=roi_mode, csv_path=csv_path, duration_min=duration_min, fps=fps)
     
+    
+    # Get GCS folders (if credentials available)
+    gcs_folders = []
+    try:
+        gcs_folders = gcs_utils.list_all_folders_recursive("bk-urbaneye-videos")
+    except Exception as e:
+        print(f"Warning: Could not list GCS folders: {e}")
+
     with gr.Blocks() as demo:
         gr.Markdown("## Sistema de Vigilancia - DeepFace Stream (video)")
-        path_in = gr.Textbox(value=default_video, label="Ruta del video", interactive=True)
+        
+        with gr.Row():
+            source_mode = gr.Dropdown(
+                choices=["Local File", "GCS Folder"],
+                value="Local File",
+                label="Modo de Fuente",
+                interactive=True
+            )
+        
+        with gr.Group(visible=True) as local_group:
+            path_in = gr.Textbox(value=default_video, label="Ruta del video local", interactive=True)
+            
+        with gr.Group(visible=False) as gcs_group:
+            folder_dd = gr.Dropdown(choices=gcs_folders, label="Carpeta GCS", interactive=True)
+            refresh_btn = gr.Button("Refrescar Carpetas")
+            progress_output = gr.Textbox(label="Progreso del Lote", interactive=False)
+
+        with gr.Row():
+            lat_input = gr.Textbox(value=config.LATITUD, label="Latitud", interactive=True)
+            lon_input = gr.Textbox(value=config.LONGITUD, label="Longitud", interactive=True)
+            lugar_input = gr.Textbox(value=config.LUGAR, label="Lugar", interactive=True)
+
         roi_size_slider = gr.Slider(
             minimum=0.1,
             maximum=1.0,
@@ -131,13 +184,97 @@ def build_demo(
         output = gr.Image(label="Stream", streaming=True, type="numpy")
         start_btn = gr.Button("Iniciar")
         
-        def start(vpath: str, roi_size: float) -> Generator[np.ndarray, None, None]:
-            # Reset ROI config for new video
-            set_roi_config(roi_mode=roi_mode, csv_path=csv_path, duration_min=duration_min, fps=fps)
-            # Stream with throttled DeepFace analysis for smoother playback
-            yield from stream_generator(vpath, analyze_every_n=10, max_width=640, roi_size=roi_size)
+        def toggle_inputs(mode):
+            return {
+                local_group: gr.Group(visible=(mode == "Local File")),
+                gcs_group: gr.Group(visible=(mode == "GCS Folder"))
+            }
+            
+        source_mode.change(fn=toggle_inputs, inputs=source_mode, outputs=[local_group, gcs_group])
         
-        start_btn.click(fn=start, inputs=[path_in, roi_size_slider], outputs=output)
+        def refresh_gcs():
+            try:
+                folders = gcs_utils.list_all_folders_recursive("bk-urbaneye-videos")
+                return gr.Dropdown(choices=folders)
+            except Exception as e:
+                return gr.Dropdown(choices=[])
+                
+        refresh_btn.click(fn=refresh_gcs, inputs=[], outputs=folder_dd)
+        
+        def start(mode: str, vpath: str, folder: str, roi_size: float, lat: str, lon: str, place: str) -> Generator[Tuple[np.ndarray, str], None, None]:
+            
+            if mode == "Local File":
+                # Detect FPS for local video
+                real_fps = get_video_fps(vpath)
+                print(f"Detected FPS for {vpath}: {real_fps}")
+                
+                # Reset ROI config
+                set_roi_config(
+                    roi_mode=roi_mode, 
+                    csv_path=csv_path, 
+                    duration_min=duration_min, 
+                    fps=real_fps,
+                    latitud=lat,
+                    longitud=lon,
+                    lugar=place
+                )
+                
+                # Generator wrapper to yield (image, progress)
+                gen = stream_generator(vpath, analyze_every_n=10, max_width=640, roi_size=roi_size, yield_every_n=3)
+                for frame in gen:
+                    yield frame, "Procesando video local..."
+            else:
+                # GCS Batch Mode
+                if not folder:
+                    yield np.zeros((100, 100, 3), dtype=np.uint8), "Error: Seleccione una carpeta"
+                    return
+                try:
+                    videos = gcs_utils.list_videos_in_folder("bk-urbaneye-videos", folder)
+                    total_videos = len(videos)
+                    
+                    for i, video_blob in enumerate(videos):
+                        video_name = os.path.basename(video_blob)
+                        progress_msg = f"Procesando video {i+1} de {total_videos}: {video_name}"
+                        
+                        # Yield loading state
+                        yield np.zeros((100, 100, 3), dtype=np.uint8), f"Descargando {video_name}..."
+                        
+                        # Download to temp file
+                        temp_path = os.path.join(os.getcwd(), "temp_video.mp4")
+                        gcs_utils.download_blob("bk-urbaneye-videos", video_blob, temp_path)
+                        
+                        try:
+                            # Detect FPS for downloaded video
+                            real_fps = get_video_fps(temp_path)
+                            print(f"Detected FPS for {video_blob}: {real_fps}")
+                            
+                            # Reset/Update ROI config for this video
+                            set_roi_config(
+                                roi_mode=roi_mode, 
+                                csv_path=csv_path, 
+                                duration_min=duration_min, 
+                                fps=real_fps,
+                                latitud=lat,
+                                longitud=lon,
+                                lugar=place
+                            )
+                            
+                            gen = stream_generator(temp_path, analyze_every_n=10, max_width=640, roi_size=roi_size, yield_every_n=3)
+                            for frame in gen:
+                                yield frame, progress_msg
+                                
+                        finally:
+                            if os.path.exists(temp_path):
+                                os.remove(temp_path)
+                except Exception as e:
+                    print(f"Error processing GCS folder: {e}")
+                    yield np.zeros((100, 100, 3), dtype=np.uint8), f"Error: {e}"
+        
+        start_btn.click(
+            fn=start, 
+            inputs=[source_mode, path_in, folder_dd, roi_size_slider, lat_input, lon_input, lugar_input], 
+            outputs=[output, progress_output]
+        )
     
     # Warm-up: run a quick analyze on first frame to load models
     try:

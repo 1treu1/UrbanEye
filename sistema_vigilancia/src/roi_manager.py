@@ -8,7 +8,15 @@ from typing import Dict, Any
 import sistema_vigilancia.src.config as config
 
 
-def set_roi_config(roi_mode: str, csv_path: str, duration_min: int, fps: int) -> None:
+def set_roi_config(
+    roi_mode: str, 
+    csv_path: str, 
+    duration_min: int, 
+    fps: int,
+    latitud: str = "",
+    longitud: str = "",
+    lugar: str = ""
+) -> None:
     """Configure ROI tracking settings.
     
     Args:
@@ -16,12 +24,24 @@ def set_roi_config(roi_mode: str, csv_path: str, duration_min: int, fps: int) ->
         csv_path: Path to CSV file for exporting data
         duration_min: Window duration in minutes
         fps: Assumed frames per second
+        latitud: Location latitude
+        longitud: Location longitude
+        lugar: Location name
     """
     config.ROI_MODE = roi_mode
     config.CSV_PATH = csv_path
     config.FPS_ASSUMED = fps
     config.WINDOW_FRAMES = max(1, duration_min * 60 * fps)
     config.GLOBAL_FRAME_IDX = 0
+    
+    # Update location config
+    if latitud: config.LATITUD = latitud
+    if longitud: config.LONGITUD = longitud
+    if lugar: config.LUGAR = lugar
+    
+    # Reset DeepFace state
+    config.LAST_DEEPFACE_FRAME = -config.DEEPFACE_FRAME_SKIP
+    config.DEEPFACE_CACHE.clear()
     
     # Reset tracker
     config.NEXT_TRACK_ID = 1

@@ -7,7 +7,7 @@ from ultralytics import YOLO
 # ROI tracking configuration
 ROI_MODE: str = "none"  # none | consolidated | visits
 CSV_PATH: str = ""
-FPS_ASSUMED: int = 22
+FPS_ASSUMED: int = 14.90
 WINDOW_FRAMES: int = 0
 GLOBAL_FRAME_IDX: int = 0
 
