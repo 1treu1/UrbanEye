@@ -70,10 +70,14 @@ def process_video(video_path, output_csv_path):
             
             frame_idx += 1
             
+            if frame_idx % 100 == 0:
+                logger.info(f"Processed {frame_idx} frames...")
+            
         # Flush any remaining tracks
         if config.ROI_MODE != "none":
             flush_window()
             
+        logger.info(f"Video processing finished. Total frames: {frame_idx}")
         return True
     except Exception as e:
         logger.error(f"Error processing video: {e}")

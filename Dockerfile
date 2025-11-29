@@ -15,7 +15,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-ENV PORT=8081
+ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
 
 CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 sistema_vigilancia.src.cloud_run_main:app
