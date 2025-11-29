@@ -2,7 +2,7 @@ FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
 
 # Instalar Python y dependencias del sistema para OpenCV
 RUN apt-get update && apt-get install -y \
-    python3.12 \
+    python3 \
     python3-pip \
     libgl1-mesa-glx \
     libglib2.0-0 \
