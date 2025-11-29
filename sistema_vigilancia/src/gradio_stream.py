@@ -277,6 +277,7 @@ def build_demo(
         )
     
     # Warm-up: run a quick analyze on first frame to load models
+    print("Inicializando modelos de IA (DeepFace + YOLO)... Por favor espere.")
     try:
         cap = cv2.VideoCapture(default_video)
         ok, frame = cap.read()
