@@ -22,22 +22,28 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. CREAR ENTORNO VIRTUAL (VENV)
-# Esto aísla tu código de las librerías viejas del sistema (soluciona lo de blinker)
 ENV VIRTUAL_ENV=/opt/venv
 RUN python3.12 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# 4. Instalar pip y dependencias DENTRO del venv
+# 4. PREPARAR EL DIRECTORIO DE TRABAJO
+WORKDIR /app
+
+# --- AQUÍ ESTÁ LA CORRECCIÓN ---
+# Primero copiamos SOLO el requirements.txt
+COPY requirements.txt .
+
+# Ahora sí podemos instalar, porque el archivo ya existe dentro de la imagen
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 RUN pip install tf-keras
 
-WORKDIR /app
+# Finalmente copiamos el resto del código
 COPY . .
 
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
 
-# 5. Ejecutar (Al estar el PATH configurado, 'gunicorn' usa el del venv automáticamente)
+# 5. Ejecutar
 CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 sistema_vigilancia.src.cloud_run_main:app
