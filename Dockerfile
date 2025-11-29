@@ -1,31 +1,31 @@
 FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
 
-# Instalar Python 3.12, Build Tools y dependencias
+# 1. Instalar dependencias del sistema, PPA y Python 3.12
+# Nota: Se agregó 'curl' para instalar pip manualmente después
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    # Paquetes necesarios para la compilación (Corrige error como 'contourpy')
     build-essential \
-    # Paquetes necesarios para añadir el PPA
     software-properties-common \
-    # Añadir el PPA de deadsnakes para Python 3.12
+    curl \
     && add-apt-repository ppa:deadsnakes/ppa -y \
-    # Actualizar e instalar Python 3.12
     && apt-get update && \
     apt-get install -y --no-install-recommends \
     python3.12 \
     python3.12-dev \
-    python3.12-distutils \
     python3.12-venv \
-    # Otras dependencias del sistema
     libgl1-mesa-glx \
     libglib2.0-0 \
-    # Limpiar
     && rm -rf /var/lib/apt/lists/*
+
+# 2. Instalar PIP para Python 3.12 manualmente
+# (Esto es necesario porque el paquete python3-pip de Ubuntu suele ser para Python 3.10)
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
 
 WORKDIR /app
 
 COPY requirements.txt .
-# CORRECCIÓN: Llamar a pip usando el ejecutable python3.12
+
+# 3. Instalar dependencias usando pip de Python 3.12
 RUN python3.12 -m pip install --no-cache-dir -r requirements.txt
 
 COPY . .
@@ -33,5 +33,5 @@ COPY . .
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
 
-# CORRECCIÓN: Ejecutar gunicorn usando el ejecutable python3.12
+# 4. Ejecutar con Python 3.12
 CMD exec python3.12 -m gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 sistema_vigilancia.src.cloud_run_main:app
