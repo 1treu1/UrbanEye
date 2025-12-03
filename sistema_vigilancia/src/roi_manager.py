@@ -133,6 +133,8 @@ def write_track_to_csv(tid: int, track: Dict[str, Any], state: VideoState) -> No
                     state.longitud or "",
                     state.lugar or ""
                 ])
+                f.flush()
+                os.fsync(f.fileno())
     except Exception as e:
         print(f"Error writing to CSV: {e}")
 

@@ -189,7 +189,15 @@ def analyze_roi_with_deepface(
         if isinstance(df_roi_results, dict):
             df_roi_results = [df_roi_results]
         
+        if not df_roi_results:
+            print(f"DeepFace warning: No results returned for frame {state.global_frame_idx}")
+
         for res in df_roi_results or []:
+            # Check confidence if available (DeepFace structure varies, but let's log if it looks suspicious)
+            if res.get("face_confidence", 1.0) < 0.4:
+                 # Log but continue, maybe it's a false positive
+                 pass
+
             region = res.get("region") or {}
             parsed = parse_deepface_region(region, (rx0, ry0))
             
@@ -203,6 +211,11 @@ def analyze_roi_with_deepface(
             
             # Extract attributes
             attrs = extract_deepface_attributes(res)
+            
+            # Log if attributes are empty/zero which suggests detection failed or returned garbage
+            if not attrs.get("age") or attrs.get("age") == 0:
+                 print(f"DeepFace warning: Empty attributes for track {best_track_id} (Frame {state.global_frame_idx}): {attrs}")
+
             df_attrs = {
                 "bbox": (df_x, df_y, df_w, df_h),
                 **attrs
@@ -231,8 +244,9 @@ def analyze_roi_with_deepface(
                 # No match: standalone detection
                 deepface_full_roi_results.append(df_attrs)
     
-    except Exception:
+    except Exception as e:
         # DeepFace failed, continue with cached results
+        print(f"DeepFace error at frame {state.global_frame_idx}: {e}")
         pass
     
     return deepface_results, deepface_full_roi_results
