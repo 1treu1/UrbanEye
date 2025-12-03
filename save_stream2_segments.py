@@ -8,7 +8,7 @@ import glob
 import threading
 from google.cloud import storage
 
-def upload_to_gcs_thread(bucket_name, source_file_name, destination_blob_name, credentials_path):
+def upload_to_gcs_thread(bucket_name, source_file_name, destination_blob_name, credentials_path, metadata=None):
     """Uploads a file to the bucket in a separate thread."""
     def _upload():
         try:
@@ -16,6 +16,8 @@ def upload_to_gcs_thread(bucket_name, source_file_name, destination_blob_name, c
             storage_client = storage.Client.from_service_account_json(credentials_path)
             bucket = storage_client.bucket(bucket_name)
             blob = bucket.blob(destination_blob_name)
+            if metadata:
+                blob.metadata = metadata
             blob.upload_from_filename(source_file_name)
             print(f"[Upload] Success: {source_file_name}")
             
@@ -74,7 +76,7 @@ def stop_ffmpeg_gracefully(process):
     process.wait()
     return False
 
-def save_stream_segments_async(stream_url, segment_duration_minutes, output_dir, bucket_name, place_name, camera_name):
+def save_stream_segments_async(stream_url, segment_duration_minutes, output_dir, bucket_name, place_name, camera_name, lat=None, lon=None):
     """
     Records a stream, stops gracefully, and uploads asynchronously.
     """
@@ -154,7 +156,17 @@ def save_stream_segments_async(stream_url, segment_duration_minutes, output_dir,
                 # Check if file size is > 0 (basic corruption check)
                 if os.path.getsize(output_filename) > 0:
                     gcs_path = f"{place_name}/{date_folder}/{camera_name}/{filename_only}"
-                    upload_to_gcs_thread(bucket_name, output_filename, gcs_path, credentials_path)
+                    
+                    metadata = {
+                        "created_at": now.isoformat(),
+                        "segment_seconds": str(segment_duration_seconds)
+                    }
+                    if lat:
+                        metadata["latitude"] = str(lat)
+                    if lon:
+                        metadata["longitude"] = str(lon)
+                        
+                    upload_to_gcs_thread(bucket_name, output_filename, gcs_path, credentials_path, metadata)
                 else:
                     print(f"Warning: File {output_filename} is empty. Skipping upload.")
             
@@ -178,6 +190,9 @@ if __name__ == "__main__":
     parser.add_argument("--lugar", type=str, required=True, help="Place name (e.g., 'oficina')")
     parser.add_argument("--camara", type=str, required=True, help="Camera name (e.g., 'camara_1')")
     
+    parser.add_argument("--lat", type=str, help="Latitude")
+    parser.add_argument("--lon", type=str, help="Longitude")
+    
     args = parser.parse_args()
     
-    save_stream_segments_async(args.url, args.minutes, args.out, args.bucket, args.lugar, args.camara)
+    save_stream_segments_async(args.url, args.minutes, args.out, args.bucket, args.lugar, args.camara, args.lat, args.lon)
