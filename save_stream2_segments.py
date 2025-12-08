@@ -7,6 +7,7 @@ import signal
 import glob
 import threading
 from google.cloud import storage
+import wifi_geolocation
 
 def upload_to_gcs_thread(bucket_name, source_file_name, destination_blob_name, credentials_path, metadata=None):
     """Uploads a file to the bucket in a separate thread."""
@@ -123,7 +124,7 @@ def save_stream_segments_async(stream_url, segment_duration_minutes, output_dir,
                 "ffmpeg",
                 "-y",
                 "-rtsp_transport", "tcp",
-                "-timeout", "5000000",
+                "-stimeout", "5000000",
                 "-use_wallclock_as_timestamps", "1",
                 "-fflags", "+genpts",
                 "-i", stream_url,
@@ -194,5 +195,19 @@ if __name__ == "__main__":
     parser.add_argument("--lon", type=str, help="Longitude")
     
     args = parser.parse_args()
+
+    # Auto-detect location if not provided
+    if not args.lat or not args.lon:
+        print("[Auto-Location] Latitude/Longitude not provided. Attempting to detect via Wi-Fi...")
+        try:
+            detected_lat, detected_lon, _ = wifi_geolocation.get_device_location()
+            if detected_lat and detected_lon:
+                args.lat = str(detected_lat)
+                args.lon = str(detected_lon)
+                print(f"[Auto-Location] Success: {args.lat}, {args.lon}")
+            else:
+                print("[Auto-Location] Failed to detect location.")
+        except Exception as e:
+            print(f"[Auto-Location] Error during detection: {e}")
     
     save_stream_segments_async(args.url, args.minutes, args.out, args.bucket, args.lugar, args.camara, args.lat, args.lon)
