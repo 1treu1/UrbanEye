@@ -13,10 +13,10 @@ source .venv/bin/activate
 # --- CONFIGURATION ---
 STREAM_URL="rtsp://1treu1:treutapo@192.168.0.102:554/stream2"
 BUCKET_NAME="bk-urbaneye-videos"
-LUGAR="videos/Pereira"
-CAMARA="camara_03"
+LUGAR="videos/Bogota"
+CAMARA="camara_01"
 OUTPUT_DIR="sistema_vigilancia/videos"
-DURATION_MINUTES=60
+DURATION_MINUTES=5
 # ---------------------
 
 echo "Starting UrbanEye..."
