@@ -11,24 +11,24 @@ cd "$(dirname "$0")"
 source .venv/bin/activate
 
 # --- CONFIGURATION ---
-# PLEASE EDIT THESE VALUES
-STREAM_URL="rtsp://admin:password@192.168.1.100:554/stream"
-BUCKET_NAME="my-gcs-bucket-name"
-LUGAR="home"
-CAMARA="cam_front"
+STREAM_URL="rtsp://1treu1:treutapo@192.168.0.102:554/stream2"
+BUCKET_NAME="bk-urbaneye-videos"
+LUGAR="videos/Pereira"
+CAMARA="camara_03"
+OUTPUT_DIR="sistema_vigilancia/videos"
+DURATION_MINUTES=1
 # ---------------------
 
 echo "Starting UrbanEye..."
 echo "URL: $STREAM_URL"
 echo "Bucket: $BUCKET_NAME"
+echo "Camara: $CAMARA"
 
 # Run the Python script
-# Add --lat and --lon arguments if you want to hardcode location instead of auto-detect
 python save_stream2_segments.py \
     --url "$STREAM_URL" \
     --bucket "$BUCKET_NAME" \
     --lugar "$LUGAR" \
     --camara "$CAMARA" \
-    --minutes 1 \
-    --out "recordings"
-
+    --minutes "$DURATION_MINUTES" \
+    --out "$OUTPUT_DIR"
