@@ -25,7 +25,7 @@ echo "Bucket: $BUCKET_NAME"
 echo "Camara: $CAMARA"
 
 # Run the Python script
-python save_stream2_segments.py \
+python -u save_stream2_segments.py \
     --url "$STREAM_URL" \
     --bucket "$BUCKET_NAME" \
     --lugar "$LUGAR" \

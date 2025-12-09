@@ -12,24 +12,44 @@ import wifi_geolocation
 def upload_to_gcs_thread(bucket_name, source_file_name, destination_blob_name, credentials_path, metadata=None):
     """Uploads a file to the bucket in a separate thread."""
     def _upload():
-        try:
-            print(f"[Upload] Starting upload: {source_file_name} -> {destination_blob_name}")
-            storage_client = storage.Client.from_service_account_json(credentials_path)
-            bucket = storage_client.bucket(bucket_name)
-            blob = bucket.blob(destination_blob_name)
-            if metadata:
-                blob.metadata = metadata
-            blob.upload_from_filename(source_file_name)
-            print(f"[Upload] Success: {source_file_name}")
-            
-            # Delete local file after successful upload
-            if os.path.exists(source_file_name):
-                os.remove(source_file_name)
-                print(f"[Upload] Deleted local file: {source_file_name}")
+        max_retries = 5
+        base_delay = 10 # Seconds
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"[Upload] Attempt {attempt}/{max_retries}: {source_file_name} -> {destination_blob_name}")
+                # Set a timeout for the client operations (connection and read)
+                storage_client = storage.Client.from_service_account_json(credentials_path)
+                bucket = storage_client.bucket(bucket_name)
+                blob = bucket.blob(destination_blob_name)
                 
-        except Exception as e:
-            print(f"[Upload] Failed to upload {source_file_name}: {e}")
-            # We do NOT delete the file if upload fails, so it can be recovered manually
+                if metadata:
+                    blob.metadata = metadata
+                
+                # Explicitly setting timeout=300 (5 minutes) for the upload call.
+                blob.upload_from_filename(source_file_name, timeout=300)
+                
+                print(f"[Upload] Success: {source_file_name}")
+                
+                # Delete local file after successful upload
+                if os.path.exists(source_file_name):
+                    os.remove(source_file_name)
+                    print(f"[Upload] Deleted local file: {source_file_name}")
+                
+                # Break the loop if successful
+                return 
+
+            except Exception as e:
+                print(f"[Upload] Error on attempt {attempt}: {e}")
+                if attempt < max_retries:
+                    # Exponential backoff: 10s, 20s, 40s, 80s...
+                    sleep_time = base_delay * (2 ** (attempt - 1))
+                    print(f"[Upload] Retrying in {sleep_time} seconds...")
+                    time.sleep(sleep_time)
+                else:
+                    print(f"[Upload] FINAL FAILURE. Deleting local file to save space: {source_file_name}")
+                    if os.path.exists(source_file_name):
+                        os.remove(source_file_name)
 
     thread = threading.Thread(target=_upload)
     thread.daemon = True # Daemon thread so it doesn't block script exit
