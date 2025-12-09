@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Ensure this User matches your Pi username (usually 'pi' or your custom user)
-User=pi
-WorkingDirectory=/home/pi/UrbanEye
-ExecStart=/bin/bash /home/pi/UrbanEye/start_urbaneye.sh
+# Updated user to match your prompt (treu)
+User=treu
+WorkingDirectory=/home/treu/UrbanEye
+ExecStart=/bin/bash /home/treu/UrbanEye/start_urbaneye.sh
 Restart=on-failure
 RestartSec=10
 StandardOutput=inherit
