@@ -16,7 +16,7 @@ BUCKET_NAME="bk-urbaneye-videos"
 LUGAR="videos/Pereira"
 CAMARA="camara_03"
 OUTPUT_DIR="sistema_vigilancia/videos"
-DURATION_MINUTES=1
+DURATION_MINUTES=60
 # ---------------------
 
 echo "Starting UrbanEye..."
