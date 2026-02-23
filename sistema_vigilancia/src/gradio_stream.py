@@ -7,6 +7,7 @@ import time
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Generator, Optional, Tuple, List
+from datetime import datetime
 import cv2
 import gradio as gr
 import numpy as np
@@ -35,12 +36,12 @@ from .gpu_setup import ensure_tf_gpu
 def process_video_headless(
     video_blob: str,
     roi_mode: str,
-    csv_path: str,
     duration_min: int,
     roi_size: float,
     lat: str,
     lon: str,
-    place: str
+    place: str,
+    video_start_time: Optional[datetime] = None
 ) -> str:
     """Process a video in background without UI updates."""
     # Ensure GPU is configured in this child process
@@ -54,12 +55,23 @@ def process_video_headless(
         os.close(fd)
         
         print(f"Background processing: Downloading {video_blob}...")
-        gcs_utils.download_blob("bk-urbaneye-videos", video_blob, temp_path)
+        metadata = gcs_utils.download_blob("bk-urbaneye-videos", video_blob, temp_path)
         
+        # Extract start time from metadata if not provided
+        if not video_start_time and metadata and "created_at" in metadata:
+            try:
+                # Parse ISO format: 2025-11-03T17:22:55.980014
+                video_start_time = datetime.fromisoformat(metadata["created_at"])
+            except Exception as e:
+                print(f"Error parsing metadata date: {e}")
+
         real_fps = get_video_fps(temp_path)
         print(f"Background processing: {video_blob} (FPS: {real_fps})")
         
-        state = VideoState(roi_mode, csv_path, duration_min, real_fps, lat, lon, place)
+        # Extract video name from blob path for Parquet filename
+        video_name = os.path.splitext(os.path.basename(video_blob))[0]
+        
+        state = VideoState(roi_mode, duration_min, real_fps, lat, lon, place, video_start_time, video_name)
         
         cap = cv2.VideoCapture(temp_path)
         if not cap.isOpened():
@@ -113,7 +125,6 @@ def process_video_headless(
 def stream_generator(
     video_path: str,
     roi_mode: str,
-    csv_path: str,
     duration_min: int,
     lat: str,
     lon: str,
@@ -122,7 +133,8 @@ def stream_generator(
     max_width: int = 640,
     roi_size: float = 0.65,
     yield_every_n: int = 3,
-    visualize: bool = True
+    visualize: bool = True,
+    video_start_time: Optional[datetime] = None
 ) -> Generator[Tuple[np.ndarray, float], None, None]:
     """Generate annotated video frames for Gradio streaming.
     
@@ -132,7 +144,8 @@ def stream_generator(
     
     # Initialize state for this video
     real_fps = get_video_fps(video_path)
-    state = VideoState(roi_mode, csv_path, duration_min, real_fps, lat, lon, place)
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    state = VideoState(roi_mode, duration_min, real_fps, lat, lon, place, video_start_time, video_name)
     print(f"Streaming video: {video_path} (FPS: {real_fps})")
     
     cap = cv2.VideoCapture(video_path)
@@ -220,15 +233,10 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, Future
 def build_demo(
     default_video: str,
     roi_mode: str = "consolidated",
-    csv_path: str = "",
     duration_min: int = 30,
     fps: int = 22
 ) -> gr.Blocks:
     """Build Gradio demo interface."""
-    # Set ROI configuration - auto-configure CSV path if not provided
-    if not csv_path:
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        csv_path = os.path.join(base_dir, "roi_stats.csv")
     
     # Get GCS folders (if credentials available)
     gcs_folders = []
@@ -320,7 +328,7 @@ def build_demo(
             if mode == "Local File":
                 # Generator wrapper to yield (image, progress, status)
                 gen = stream_generator(
-                    vpath, roi_mode, csv_path, duration_min, lat, lon, place,
+                    vpath, roi_mode, duration_min, lat, lon, place,
                     analyze_every_n=10, max_width=640, roi_size=roi_size, yield_every_n=3,
                     visualize=visualize
                 )
@@ -367,7 +375,7 @@ def build_demo(
                                 print(f"Submitting background task: {bg_video}")
                                 f = executor.submit(
                                     process_video_headless, 
-                                    bg_video, roi_mode, csv_path, duration_min, roi_size, lat, lon, place
+                                    bg_video, roi_mode, duration_min, roi_size, lat, lon, place, None
                                 )
                                 futures.append(f)
                                 if len(video_queue) == 0:
@@ -401,13 +409,21 @@ def build_demo(
                                 
                                 fd, temp_path = tempfile.mkstemp(suffix=".mp4")
                                 os.close(fd)
-                                gcs_utils.download_blob("bk-urbaneye-videos", ui_video_blob, temp_path)
+                                metadata = gcs_utils.download_blob("bk-urbaneye-videos", ui_video_blob, temp_path)
+                                
+                                video_start_time = None
+                                if metadata and "created_at" in metadata:
+                                    try:
+                                        video_start_time = datetime.fromisoformat(metadata["created_at"])
+                                    except Exception as e:
+                                        print(f"Error parsing metadata date: {e}")
                                 
                                 try:
                                     gen = stream_generator(
-                                        temp_path, roi_mode, csv_path, duration_min, lat, lon, place,
+                                        temp_path, roi_mode, duration_min, lat, lon, place,
                                         analyze_every_n=10, max_width=640, roi_size=roi_size, yield_every_n=3,
-                                        visualize=visualize
+                                        visualize=visualize,
+                                        video_start_time=video_start_time
                                     )
                                     
                                     frame_counter = 0

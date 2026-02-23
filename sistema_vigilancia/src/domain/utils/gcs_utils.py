@@ -63,9 +63,21 @@ def list_videos_in_folder(bucket_name: str, folder_name: str) -> List[str]:
             
     return videos
 
-def download_blob(bucket_name: str, source_blob_name: str, destination_file_name: str) -> None:
-    """Download a blob to a local file."""
+def download_blob(bucket_name: str, source_blob_name: str, destination_file_name: str) -> dict | None:
+    """Download a blob to a local file and return its metadata."""
     client = get_client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(source_blob_name)
     blob.download_to_filename(destination_file_name)
+    
+    # Reload blob to get metadata
+    blob.reload()
+    return blob.metadata
+
+def upload_blob(bucket_name: str, source_file_name: str, destination_blob_name: str) -> None:
+    """Uploads a file to the bucket."""
+    client = get_client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(destination_blob_name)
+    blob.upload_from_filename(source_file_name)
+    print(f"File {source_file_name} uploaded to {destination_blob_name}.")
