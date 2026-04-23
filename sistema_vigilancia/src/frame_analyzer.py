@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 from collections import deque
 
-import sistema_vigilancia.src.config as config
+import src.config as config
 from .yolo_tracker import init_yolo_model, detect_and_track_persons
 from .deepface_analyzer import (
     should_run_deepface, analyze_roi_with_deepface,
@@ -232,7 +232,7 @@ def analyze_frame(
         roi_frame_rgb = frame_rgb[ry0:ry1, rx0:rx1] if (ry1 > ry0 and rx1 > rx0) else frame_rgb
         
         deepface_results, deepface_full_roi_results = analyze_roi_with_deepface(
-            roi_frame_rgb, yolo_tracks, roi_coords, state
+            frame_rgb, yolo_tracks, roi_coords, state
         )
     else:
         # Use cache

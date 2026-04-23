@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional, Tuple
 import os
 from ultralytics import YOLO
 
-import sistema_vigilancia.src.config as config
+import src.config as config
 
 
 def init_yolo_model(model_path: Optional[str] = None) -> None:

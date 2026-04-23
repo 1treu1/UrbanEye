@@ -4,7 +4,7 @@ from typing import Dict, Any, List, Tuple, Deque
 import cv2
 import numpy as np
 
-import sistema_vigilancia.src.config as config
+import src.config as config
 from .roi_manager import VideoState
 
 

@@ -1,7 +1,7 @@
 """GPU and TensorFlow setup for DeepFace."""
 
 import os
-import sistema_vigilancia.src.config as config
+import src.config as config
 
 
 def ensure_tf_gpu() -> None:

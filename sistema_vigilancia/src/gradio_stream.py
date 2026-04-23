@@ -14,7 +14,7 @@ import numpy as np
 
 from .frame_analyzer import analyze_frame
 from .roi_manager import flush_window, write_track_to_csv, VideoState
-import sistema_vigilancia.src.config as config
+import src.config as config
 from .domain.utils import gcs_utils
 
 
@@ -122,7 +122,7 @@ def process_video_headless(
                 pass
 
 
-def stream_generator(
+def process_video(
     video_path: str,
     roi_mode: str,
     duration_min: int,
@@ -132,14 +132,14 @@ def stream_generator(
     analyze_every_n: int = 10,
     max_width: int = 640,
     roi_size: float = 0.65,
-    yield_every_n: int = 3,
     visualize: bool = True,
-    video_start_time: Optional[datetime] = None
-) -> Generator[Tuple[np.ndarray, float], None, None]:
-    """Generate annotated video frames for Gradio streaming.
+    video_start_time: Optional[datetime] = None,
+    progress_callback = None
+) -> str:
+    """Process video offline and write to an mp4 file.
     
-    Yields:
-        (frame, progress_percentage)
+    Returns:
+        The path to the generated output.mp4 file.
     """
     
     # Initialize state for this video
@@ -157,14 +157,29 @@ def stream_generator(
         total_frames = 1  # Avoid division by zero
     
     try:
-        # Small buffer to reduce latency
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-        except Exception:
-            pass
-        
         frame_idx = 0
         last_annotated: Optional[np.ndarray] = None
+        
+        # Prepare VideoWriter
+        fd, out_path = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd)
+        
+        ok, first_frame = cap.read()
+        if not ok:
+            cap.release()
+            return out_path
+            
+        h, w = first_frame.shape[:2]
+        if w > max_width:
+            scale = max_width / float(w)
+            out_w, out_h = int(w * scale), int(h * scale)
+        else:
+            out_w, out_h = w, h
+            
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out_writer = cv2.VideoWriter(out_path, fourcc, real_fps, (w, h) if visualize else (out_w, out_h))
         
         while True:
             ok, frame = cap.read()
@@ -202,25 +217,23 @@ def stream_generator(
             frame_idx += 1
             progress = (frame_idx / total_frames) * 100.0
             
+            # Write to video file
+            if annotated is not None:
+                out_writer.write(annotated)
+            
+            # Progress callback
+            if progress_callback and frame_idx % 3 == 0:
+                progress_callback(progress)
+            
             # Heartbeat log
             if frame_idx % 100 == 0:
                 print(f"Processing frame {frame_idx}/{total_frames} ({progress:.1f}%)")
-            
-            # Yield logic
-            if visualize:
-                # Stream Mode: Yield every N frames
-                if frame_idx == 1 or frame_idx % yield_every_n == 0:
-                    if annotated is not None:
-                        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-                        yield annotated_rgb, progress
-            else:
-                # Fast Mode: Yield less frequently (e.g., every 30 frames)
-                if frame_idx == 1 or frame_idx % 30 == 0:
-                    annotated_rgb = np.zeros((100, 100, 3), dtype=np.uint8) 
-                    yield annotated_rgb, progress
     
     finally:
+        if 'out_writer' in locals():
+            out_writer.release()
         cap.release()
+        return out_path
 
 
 import multiprocessing as mp
@@ -289,7 +302,7 @@ def build_demo(
         )
         
         with gr.Group():
-            output_image = gr.Image(label="Stream", streaming=True, type="numpy")
+            output_video = gr.Video(label="Video Procesado", autoplay=True)
             progress_slider = gr.Slider(minimum=0, maximum=100, value=0, label="Progreso Video Actual %", interactive=False)
             
         start_btn = gr.Button("Iniciar")
@@ -320,31 +333,34 @@ def build_demo(
             lat: str, 
             lon: str, 
             place: str, 
-            max_workers: int
-        ) -> Generator[Tuple[np.ndarray, float, str], None, None]:
+            max_workers: int,
+            progress=gr.Progress()
+        ) -> Generator[Tuple[Optional[str], float, str], None, None]:
             
             visualize = (view_mode_val == "Video Stream")
             
             if mode == "Local File":
-                # Generator wrapper to yield (image, progress, status)
-                gen = stream_generator(
+                def prog_cb(p):
+                    progress(p / 100.0, desc=f"Procesando video... {p:.1f}%")
+                    
+                yield None, 0, "Iniciando procesamiento local..."
+                out_path = process_video(
                     vpath, roi_mode, duration_min, lat, lon, place,
-                    analyze_every_n=10, max_width=640, roi_size=roi_size, yield_every_n=3,
-                    visualize=visualize
+                    analyze_every_n=10, max_width=640, roi_size=roi_size,
+                    visualize=visualize, progress_callback=prog_cb
                 )
-                for frame, progress in gen:
-                    yield frame, progress, "Procesando video local..."
+                yield out_path, 100.0, "Procesamiento de video local completado."
             else:
                 # GCS Batch Mode with Parallel Processing
                 if not folder:
-                    yield np.zeros((100, 100, 3), dtype=np.uint8), 0, "Error: Seleccione una carpeta"
+                    yield None, 0, "Error: Seleccione una carpeta"
                     return
                 try:
                     videos = gcs_utils.list_videos_in_folder("bk-urbaneye-videos", folder)
                     total_videos = len(videos)
                     
                     if total_videos == 0:
-                        yield np.zeros((100, 100, 3), dtype=np.uint8), 0, "No se encontraron videos en la carpeta"
+                        yield None, 0, "No se encontraron videos en la carpeta"
                         return
 
                     max_workers = int(max(1, max_workers))
@@ -405,7 +421,7 @@ def build_demo(
                                 
                                 # Calculate total progress (approximate)
                                 batch_progress = (completed_count / total_videos) * 100.0
-                                yield np.zeros((100, 100, 3), dtype=np.uint8), batch_progress, f"Descargando {video_name} (Lote: {completed_count}/{total_videos})..."
+                                yield None, batch_progress, f"Descargando {video_name} (Lote: {completed_count}/{total_videos})..."
                                 
                                 fd, temp_path = tempfile.mkstemp(suffix=".mp4")
                                 os.close(fd)
@@ -419,27 +435,22 @@ def build_demo(
                                         print(f"Error parsing metadata date: {e}")
                                 
                                 try:
-                                    gen = stream_generator(
+                                    def bg_prog_cb(p):
+                                        current_total_progress = ((completed_count * 100) + p) / total_videos
+                                        progress(current_total_progress / 100.0, desc=f"Procesando {video_name}...")
+                                        
+                                    out_path = process_video(
                                         temp_path, roi_mode, duration_min, lat, lon, place,
-                                        analyze_every_n=10, max_width=640, roi_size=roi_size, yield_every_n=3,
-                                        visualize=visualize,
-                                        video_start_time=video_start_time
+                                        analyze_every_n=10, max_width=640, roi_size=roi_size,
+                                        visualize=visualize, video_start_time=video_start_time,
+                                        progress_callback=bg_prog_cb
                                     )
                                     
-                                    frame_counter = 0
-                                    for frame, vid_progress in gen:
-                                        frame_counter += 1
-                                        # Periodically check background workers to keep pipeline full
-                                        if frame_counter % 30 == 0:
-                                            active_bg = maintain_background_workers()
-                                        
-                                        # Update total batch progress
-                                        # completed_count videos are done (100% each)
-                                        # current video is vid_progress% done
-                                        # total = (completed * 100 + vid_progress) / (total_videos * 100) * 100
-                                        current_total_progress = ((completed_count * 100) + vid_progress) / total_videos
-                                        
-                                        yield frame, current_total_progress, f"Procesando {video_name} (Lote: {completed_count}/{total_videos} completados + {active_bg} en segundo plano)"
+                                    # Periodically check background workers to keep pipeline full
+                                    active_bg = maintain_background_workers()
+                                    
+                                    current_total_progress = ((completed_count * 100) + 100) / total_videos
+                                    yield out_path, current_total_progress, f"Procesado {video_name} (Lote: {completed_count+1}/{total_videos} completados + {active_bg} en segundo plano)"
                                     
                                     completed_count += 1
                                 finally:
@@ -450,12 +461,12 @@ def build_demo(
                                 if futures:
                                     active_bg = maintain_background_workers()
                                     batch_progress = (completed_count / total_videos) * 100.0
-                                    yield np.zeros((100, 100, 3), dtype=np.uint8), batch_progress, f"Esperando tareas de fondo ({active_bg} activas)..."
+                                    yield None, batch_progress, f"Esperando tareas de fondo ({active_bg} activas)..."
                                     time.sleep(1)
                                 else:
                                     break
                                     
-                        yield np.zeros((100, 100, 3), dtype=np.uint8), 100, f"Procesamiento completado: {total_videos} videos."
+                        yield None, 100.0, f"Procesamiento completado: {total_videos} videos."
 
                     finally:
                         print("Shutting down executor...")
@@ -464,28 +475,18 @@ def build_demo(
 
                 except KeyboardInterrupt:
                     print("Procesamiento detenido por el usuario (KeyboardInterrupt).")
-                    yield np.zeros((100, 100, 3), dtype=np.uint8), 0, "Detenido por el usuario."
+                    yield None, 0.0, "Detenido por el usuario."
                 except Exception as e:
                     print(f"Error processing GCS folder: {e}")
-                    yield np.zeros((100, 100, 3), dtype=np.uint8), 0, f"Error: {e}"
+                    yield None, 0.0, f"Error: {e}"
         
         start_btn.click(
             fn=start, 
             inputs=[source_mode, view_mode, path_in, folder_dd, roi_size_slider, lat_input, lon_input, lugar_input, num_workers], 
-            outputs=[output_image, progress_slider, batch_progress_output]
+            outputs=[output_video, progress_slider, batch_progress_output]
         )
     
-    # Warm-up: run a quick analyze on first frame to load models
-    print("Inicializando modelos de IA (DeepFace + YOLO)... Por favor espere.")
-    try:
-        dummy_state = VideoState("none", "", 30, 22.0)
-        cap = cv2.VideoCapture(default_video)
-        ok, frame = cap.read()
-        if ok:
-            _ = analyze_frame(frame, dummy_state)
-        cap.release()
-    except Exception:
-        pass
+    # Removed warm-up to prevent CUDA thread context errors in Gradio workers
     
     return demo
 

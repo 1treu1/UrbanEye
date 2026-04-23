@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-import argparse
 import os
+# Force TensorFlow to use memory growth before any models are loaded
+os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
+os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
+
+import argparse
 from typing import Optional
 
 import cv2

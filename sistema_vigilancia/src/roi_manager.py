@@ -8,7 +8,7 @@ from typing import Dict, Any, Deque, Optional
 from collections import deque
 
 import pandas as pd
-import sistema_vigilancia.src.config as config
+import src.config as config
 from .domain.utils import gcs_utils
 
 # Global lock for CSV writing

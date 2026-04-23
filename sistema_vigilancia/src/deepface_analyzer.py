@@ -1,10 +1,23 @@
 """DeepFace face analysis and attribute extraction module."""
 
+import os
+# Suppress TF warnings
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 from typing import Dict, Any, List, Tuple, Optional
 import cv2
+
+# Force TensorFlow to use CPU only — PyTorch/YOLO owns the GPU
+# Must be done BEFORE importing DeepFace which triggers TF import
+try:
+    import tensorflow as tf
+    tf.config.set_visible_devices([], 'GPU')
+except Exception:
+    pass
+
 from deepface import DeepFace
 
-import sistema_vigilancia.src.config as config
+import src.config as config
 from .roi_manager import VideoState
 
 
@@ -151,104 +164,85 @@ def parse_deepface_region(region: Dict[str, Any], roi_offset: Tuple[int, int] = 
 
 
 def analyze_roi_with_deepface(
-    roi_frame_rgb,
+    frame_rgb,
     yolo_tracks: Dict[int, Dict[str, Any]],
     roi_coords: Tuple[int, int, int, int],
     state: VideoState
 ) -> Tuple[Dict[int, Dict[str, Any]], List[Dict[str, Any]]]:
-    """Analyze ROI region with DeepFace and match to YOLO tracks.
+    """Analyze ROI region with DeepFace using YOLO tracks for head cropping.
     
     Args:
-        roi_frame_rgb: ROI region in RGB format
+        frame_rgb: Full frame in RGB format
         yolo_tracks: Dictionary of YOLO tracks
         roi_coords: (rx0, ry0, rx1, ry1) ROI coordinates
         state: VideoState instance
     
     Returns:
         Tuple of (deepface_results, deepface_full_roi_results)
-        - deepface_results: track_id -> attributes for matched tracks
-        - deepface_full_roi_results: unmatched DeepFace detections
     """
     deepface_results: Dict[int, Dict[str, Any]] = {}
-    deepface_full_roi_results: List[Dict[str, Any]] = []
-    rx0, ry0, _, _ = roi_coords
+    deepface_full_roi_results: List[Dict[str, Any]] = [] # Unused in hybrid mode
     
     state.last_deepface_frame = state.global_frame_idx
     clean_old_cache(state)
     
-    try:
-        df_roi_results = DeepFace.analyze(
-            roi_frame_rgb,
-            actions=["age", "gender", "race", "emotion"],
-            enforce_detection=False,
-            align=True,
-            detector_backend="retinaface",
-            silent=True
-        )
-        
-        if isinstance(df_roi_results, dict):
-            df_roi_results = [df_roi_results]
-        
-        if not df_roi_results:
-            print(f"DeepFace warning: No results returned for frame {state.global_frame_idx}")
-
-        for res in df_roi_results or []:
-            # Check confidence if available (DeepFace structure varies, but let's log if it looks suspicious)
-            if res.get("face_confidence", 1.0) < 0.4:
-                 # Log but continue, maybe it's a false positive
-                 pass
-
-            region = res.get("region") or {}
-            parsed = parse_deepface_region(region, (rx0, ry0))
+    for track_id, yolo_track in yolo_tracks.items():
+        if not yolo_track["inside_roi"]:
+            continue
             
-            if parsed is None:
+        # 1. Smart Caching: Skip if we already have a stable prediction
+        if track_id in state.deepface_cache:
+            cached = state.deepface_cache[track_id]
+            if cached.get("age") is not None and cached.get("gender") is not None:
+                # Keep it alive in cache
+                cached["frame"] = state.global_frame_idx
                 continue
-            
-            df_x, df_y, df_w, df_h, (df_cx, df_cy), df_bbox_xyxy = parsed
-            
-            # Match to YOLO track
-            best_track_id = match_deepface_to_yolo(df_bbox_xyxy, (df_cx, df_cy), yolo_tracks)
-            
-            # Extract attributes
-            attrs = extract_deepface_attributes(res)
-            
-            # Log if attributes are empty/zero which suggests detection failed or returned garbage
-            if not attrs.get("age") or attrs.get("age") == 0:
-                 print(f"DeepFace warning: Empty attributes for track {best_track_id} (Frame {state.global_frame_idx}): {attrs}")
 
-            df_attrs = {
-                "bbox": (df_x, df_y, df_w, df_h),
+        # 2. Hybrid detection: Calculate head crop from YOLO bounding box
+        yx, yy, yw, yh = yolo_track["bbox"]
+        
+        # Estimate head region (top 35% of the person bbox)
+        head_y1 = max(0, int(yy - yh * 0.05)) # Slight padding above
+        head_y2 = min(frame_rgb.shape[0], int(yy + yh * 0.35))
+        head_x1 = max(0, int(yx - yw * 0.1))
+        head_x2 = min(frame_rgb.shape[1], int(yx + yw + yw * 0.1))
+        
+        head_crop = frame_rgb[head_y1:head_y2, head_x1:head_x2]
+        
+        if head_crop.size == 0 or head_crop.shape[0] < 20 or head_crop.shape[1] < 20:
+            continue # Crop too small
+            
+        try:
+            # 3. Analyze using detector_backend="skip"
+            # Force CPU context to prevent CUDA_ERROR_INVALID_HANDLE in threads
+            with tf.device('/cpu:0'):
+                df_res = DeepFace.analyze(
+                    head_crop,
+                    actions=["age", "gender", "race", "emotion"],
+                    enforce_detection=False,
+                    detector_backend="skip",
+                    silent=True
+                )
+            
+            if isinstance(df_res, list):
+                df_res = df_res[0]
+                
+            attrs = extract_deepface_attributes(df_res)
+            
+            deepface_results[track_id] = {
+                "bbox": (head_x1, head_y1, head_x2 - head_x1, head_y2 - head_y1),
                 **attrs
             }
             
-            if best_track_id is not None:
-                # Merge with existing if present
-                if best_track_id not in deepface_results:
-                    deepface_results[best_track_id] = df_attrs
-                else:
-                    existing = deepface_results[best_track_id]
-                    deepface_results[best_track_id] = {
-                        "bbox": df_attrs.get("bbox", existing.get("bbox")),
-                        "age": df_attrs.get("age") if df_attrs.get("age") is not None else existing.get("age"),
-                        "gender": df_attrs.get("gender") if df_attrs.get("gender") else existing.get("gender"),
-                        "race": df_attrs.get("race") if df_attrs.get("race") else existing.get("race"),
-                        "emotion": df_attrs.get("emotion") if df_attrs.get("emotion") else existing.get("emotion"),
-                    }
-                
-                # Update cache
-                state.deepface_cache[best_track_id] = {
-                    **deepface_results[best_track_id],
-                    "frame": state.global_frame_idx
-                }
-            else:
-                # No match: standalone detection
-                deepface_full_roi_results.append(df_attrs)
-    
-    except Exception as e:
-        # DeepFace failed, continue with cached results
-        print(f"DeepFace error at frame {state.global_frame_idx}: {e}")
-        pass
-    
+            state.deepface_cache[track_id] = {
+                **deepface_results[track_id],
+                "frame": state.global_frame_idx
+            }
+            
+        except Exception as e:
+            # Log DeepFace failures for debugging
+            print(f"DeepFace error at frame {state.global_frame_idx} track {track_id}: {e}")
+            
     return deepface_results, deepface_full_roi_results
 
 
